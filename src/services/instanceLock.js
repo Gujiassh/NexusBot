@@ -25,7 +25,7 @@ async function writeLock(lockPath) {
 
 export async function acquireInstanceLock(cfg) {
   const lockPath =
-    cfg.lockFile || path.join(os.tmpdir(), "codex-discord-bridge.lock");
+    cfg.lockFile || path.join(os.tmpdir(), "nexusbot.lock");
 
   try {
     await writeLock(lockPath);

@@ -38,7 +38,7 @@ unless it starts with an important keyword.
 Command mode (optional):
 
 ```
-!codex <your prompt here>
+!nexus <your prompt here>
 ```
 
 Important notes:

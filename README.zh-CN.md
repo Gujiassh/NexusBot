@@ -1,8 +1,8 @@
-# codex-discord-bridge
+# NexusBot
 
 中文 | [English](README.md)
 
-本地 Discord 桥接服务：可恢复 Codex CLI 会话，并将记忆写入本地。
+NexusBot 是本地 Discord 桥接服务：可恢复 Codex CLI 会话，并将记忆写入本地。
 
 ## 简介
 
@@ -52,14 +52,14 @@ python3 -m pip install --user --break-system-packages openai-agents openai pytho
 命令模式（可选）:
 
 ```
-!codex your prompt here
+!nexus your prompt here
 ```
 
 会话:
 
 ```
-!codex sessions [n]
-!codex session <id|last>
+!nexus sessions [n]
+!nexus session <id|last>
 ```
 
 斜杠命令（桥接 Codex）:
@@ -89,9 +89,9 @@ python3 -m pip install --user --break-system-packages openai-agents openai pytho
 - Owner 可批准或拒绝：
 
 ```
-!codex pending
-!codex approve <id>
-!codex reject <id>
+!nexus pending
+!nexus approve <id>
+!nexus reject <id>
 ```
 
 重要信息提示:
@@ -103,13 +103,13 @@ python3 -m pip install --user --break-system-packages openai-agents openai pytho
 会话辅助命令:
 
 ```
-!codex sessions
-!codex sessions 5
-!codex session <id|last>
-!codex task <prompt>
-!codex schedule add <channelId|here> <interval> <message>
-!codex schedule list
-!codex schedule remove <id>
+!nexus sessions
+!nexus sessions 5
+!nexus session <id|last>
+!nexus task <prompt>
+!nexus schedule add <channelId|here> <interval> <message>
+!nexus schedule list
+!nexus schedule remove <id>
 ```
 
 消息服务器（用于 cron 或外部脚本）:
@@ -157,7 +157,7 @@ curl -X POST http://127.0.0.1:18790/message \
 - `APPROVAL_ALLOWLIST_PATTERNS` (comma-separated)
 - `APPROVAL_RULES` (JSON object)
 - `MAX_CONCURRENT_RUNS` (number)
-  - Controls concurrent background task runs (`!codex task`). Normal chat remains responsive per-channel.
+  - Controls concurrent background task runs (`!nexus task`). Normal chat remains responsive per-channel.
 - `AUTO_TASK_ROUTING` (true/false)
 - `TASK_ROUTING_TIMEOUT_MS` (number)
 - `TASK_ROUTING_KEYWORDS` (comma-separated)

@@ -1,6 +1,6 @@
 # Feature Specification: Discord Codex Bridge
 
-**Feature Branch**: `003-discord-codex-bridge`  
+**Feature Branch**: `003-discord-nexusbot`  
 **Created**: 2026-01-28  
 **Status**: Draft  
 **Input**: User description: "Build a local Discord listener that watches configured channels and commands and, on request, resumes a local Codex session with a prompt to enable remote control. The service must manage Discord channels/commands, store memory locally in md/json, and allow secure configuration of the Discord bot token."

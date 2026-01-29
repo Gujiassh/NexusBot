@@ -1,6 +1,6 @@
 {
   "discordToken": "PASTE_DISCORD_BOT_TOKEN",
-  "commandPrefix": "!codex",
+  "commandPrefix": "!nexus",
   "channelAllowlist": ["CHANNEL_ID_1"],
   "allowedUserIds": ["USER_ID_1"],
   "allowedRoleIds": ["ROLE_ID_1"],
@@ -93,7 +93,7 @@
   "agentsHttpProxy": "",
   "agentsHttpsProxy": "",
   "agentsNoProxy": "",
-  "lockFile": "/tmp/codex-discord-bridge.lock",
+  "lockFile": "/tmp/nexusbot.lock",
   "registerSlashCommands": true,
   "slashGuildIds": [],
   "sessionsDir": "/path/to/.codex/sessions",

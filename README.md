@@ -1,8 +1,8 @@
-# codex-discord-bridge
+# NexusBot
 
 English | [中文](README.zh-CN.md)
 
-Local Discord bridge that resumes a Codex CLI session and stores memory locally.
+NexusBot is a local Discord bridge that resumes a Codex CLI session and stores memory locally.
 
 ## Overview
 
@@ -54,14 +54,14 @@ unless it starts with an important keyword.
 Command mode (optional):
 
 ```
-!codex your prompt here
+!nexus your prompt here
 ```
 
 Sessions:
 
 ```
-!codex sessions [n]
-!codex session <id|last>
+!nexus sessions [n]
+!nexus session <id|last>
 ```
 
 Slash commands (bridge to Codex):
@@ -91,9 +91,9 @@ Approval flow (optional):
 - Owner can approve or reject:
 
 ```
-!codex pending
-!codex approve <id>
-!codex reject <id>
+!nexus pending
+!nexus approve <id>
+!nexus reject <id>
 ```
 
 Important notes:
@@ -105,13 +105,13 @@ Important notes:
 Session helpers:
 
 ```
-!codex sessions
-!codex sessions 5
-!codex session <id|last>
-!codex task <prompt>
-!codex schedule add <channelId|here> <interval> <message>
-!codex schedule list
-!codex schedule remove <id>
+!nexus sessions
+!nexus sessions 5
+!nexus session <id|last>
+!nexus task <prompt>
+!nexus schedule add <channelId|here> <interval> <message>
+!nexus schedule list
+!nexus schedule remove <id>
 ```
 
 Message server (for cron or external scripts):
@@ -157,7 +157,7 @@ If `MESSAGE_SERVER_TOKEN` is set, add:
 - `APPROVAL_ALLOWLIST_PATTERNS` (comma-separated)
 - `APPROVAL_RULES` (JSON object)
 - `MAX_CONCURRENT_RUNS` (number)
-  - Controls concurrent background task runs (`!codex task`). Normal chat remains responsive per-channel.
+  - Controls concurrent background task runs (`!nexus task`). Normal chat remains responsive per-channel.
 - `AUTO_TASK_ROUTING` (true/false)
 - `TASK_ROUTING_TIMEOUT_MS` (number)
 - `TASK_ROUTING_KEYWORDS` (comma-separated)

@@ -1,7 +1,7 @@
 # Implementation Plan: Discord Codex Bridge
 
-**Branch**: `003-discord-codex-bridge` | **Date**: 2026-01-28 | **Spec**: [spec.md](spec.md)
-**Input**: Feature specification from `/specs/003-discord-codex-bridge/spec.md`
+**Branch**: `003-discord-nexusbot` | **Date**: 2026-01-28 | **Spec**: [spec.md](spec.md)
+**Input**: Feature specification from `/specs/003-discord-nexusbot/spec.md`
 
 ## Summary
 
@@ -49,7 +49,7 @@ N/A — this feature does not touch Logix runtime paths or performance-critical 
 ### Documentation (this feature)
 
 ```text
-specs/003-discord-codex-bridge/
+specs/003-discord-nexusbot/
 ├── plan.md
 ├── research.md
 ├── data-model.md

@@ -182,7 +182,7 @@ export async function loadConfig() {
 
   const merged = {
     discordToken: coalesce(envConfig.discordToken, fileConfig.discordToken, undefined),
-    commandPrefix: coalesce(envConfig.commandPrefix, fileConfig.commandPrefix, "!codex"),
+    commandPrefix: coalesce(envConfig.commandPrefix, fileConfig.commandPrefix, "!nexus"),
     channelAllowlist: normalizeStringArray(
       coalesce(envConfig.channelAllowlist, fileConfig.channelAllowlist, [])
     ),
@@ -360,7 +360,7 @@ export async function loadConfig() {
     lockFile: coalesce(
       envConfig.lockFile,
       fileConfig.lockFile,
-      path.join(os.tmpdir(), "codex-discord-bridge.lock")
+      path.join(os.tmpdir(), "nexusbot.lock")
     ),
     registerSlashCommands: coalesce(
       envConfig.registerSlashCommands,

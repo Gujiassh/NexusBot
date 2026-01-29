@@ -1,5 +1,6 @@
 {
-  "name": "codex-discord-bridge",
+  "name": "nexusbot",
+  "description": "NexusBot: Discord bridge for Codex CLI with local memory logs",
   "version": "0.1.0",
   "private": true,
   "type": "module",

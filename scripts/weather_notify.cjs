@@ -8,7 +8,7 @@ const DEFAULT_QUERY = "Shuangpu, Xihu District, Hangzhou, China";
 const DEFAULT_COORDS = { latitude: 30.086, longitude: 120.101 };
 const DEFAULT_NAME = "西湖区双浦镇";
 const TIMEZONE = "Asia/Shanghai";
-const USER_AGENT = "codex-discord-bridge/1.0 (weather notify)";
+const USER_AGENT = "NexusBot/1.0 (weather notify)";
 
 function formatDateInTz(date, timeZone) {
   return new Intl.DateTimeFormat("en-CA", {

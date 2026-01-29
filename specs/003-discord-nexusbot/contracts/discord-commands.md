@@ -2,14 +2,14 @@
 
 ## Command Prefix
 
-- **Default**: `!codex`
+- **Default**: `!nexus`
 - **Configurable**: `commandPrefix` in config or `COMMAND_PREFIX` env
 
 ## Command: Resume Codex
 
 **Syntax**:
 ```
-!codex <prompt>
+!nexus <prompt>
 ```
 
 **Behavior**:
@@ -32,7 +32,7 @@
 ```json
 {
   "discordToken": "...",
-  "commandPrefix": "!codex",
+  "commandPrefix": "!nexus",
   "channelAllowlist": ["123", "456"],
   "allowedUserIds": ["789"],
   "allowedRoleIds": ["987"],

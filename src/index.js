@@ -757,7 +757,9 @@ async function main() {
       const action = (parts[1] || "").toLowerCase();
       const targetId = parts[2];
       if (!action || !targetId) {
-        await message.reply({ content: "用法: !codex owner add <id> / !codex owner remove <id>" });
+        await message.reply({
+          content: `用法: ${cfg.commandPrefix} owner add <id> / ${cfg.commandPrefix} owner remove <id>`,
+        });
         return true;
       }
       const owners = new Set(Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : []);
@@ -766,7 +768,9 @@ async function main() {
       } else if (action === "remove") {
         owners.delete(targetId);
       } else {
-        await message.reply({ content: "用法: !codex owner add <id> / !codex owner remove <id>" });
+        await message.reply({
+          content: `用法: ${cfg.commandPrefix} owner add <id> / ${cfg.commandPrefix} owner remove <id>`,
+        });
         return true;
       }
       const nextOwners = [...owners];
