@@ -1,0 +1,87 @@
+{
+  "timezone": "Asia/Shanghai",
+  "maxItemsPerSection": 5,
+  "sections": [
+    {
+      "name": "美股",
+      "feeds": [
+        {
+          "name": "Nasdaq Markets",
+          "url": "https://www.nasdaq.com/feed/rssoutbound?category=Markets"
+        },
+        {
+          "name": "WSJ Markets",
+          "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+        }
+      ]
+    },
+    {
+      "name": "加密",
+      "feeds": [
+        {
+          "name": "CoinDesk",
+          "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"
+        },
+        {
+          "name": "Nasdaq Crypto",
+          "url": "https://www.nasdaq.com/feed/rssoutbound?category=Cryptocurrencies"
+        }
+      ]
+    },
+    {
+      "name": "全球政治/军事",
+      "keywords": [
+        "war",
+        "military",
+        "defense",
+        "army",
+        "missile",
+        "nuclear",
+        "attack",
+        "security",
+        "conflict",
+        "ceasefire",
+        "sanction",
+        "election",
+        "government",
+        "president",
+        "prime minister",
+        "parliament",
+        "diplomatic",
+        "coup",
+        "terror",
+        "strike",
+        "nato",
+        "un ",
+        "summit",
+        "minister",
+        "外交",
+        "军事",
+        "战争",
+        "冲突",
+        "制裁",
+        "选举",
+        "政府",
+        "总统",
+        "首相",
+        "国会",
+        "军",
+        "袭击",
+        "导弹",
+        "安全",
+        "北约",
+        "联合国"
+      ],
+      "feeds": [
+        {
+          "name": "The Guardian World",
+          "url": "https://www.theguardian.com/world/rss"
+        },
+        {
+          "name": "Al Jazeera",
+          "url": "https://www.aljazeera.com/xml/rss/all.xml"
+        }
+      ]
+    }
+  ]
+}
