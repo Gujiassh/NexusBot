@@ -9,6 +9,58 @@ NexusBot is a local Discord bridge that resumes a Codex CLI session and stores m
 Run a lightweight Discord bot that forwards messages to your local Codex CLI,
 optionally enforces allowlists/approvals, and records memory to JSONL/Markdown.
 
+## Why NexusBot
+
+- Reduces Moltbot token burn by leaning on Codex CLI caching for repeated context (savings depend on provider/config).
+- Improves long-running stability: local Node service + reconnect logic; keep it alive with a process manager.
+- Discord-only integration by choice, because it is the only chat surface used right now.
+
+## Keeping NexusBot running
+
+NexusBot is a Node.js process. To keep it alive over long periods (and auto-restart on crashes),
+use a process manager such as systemd or PM2.
+
+### Option A: systemd (recommended on Linux)
+
+Create a user service file at `~/.config/systemd/user/nexusbot.service`:
+
+```
+[Unit]
+Description=NexusBot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/nexusbot
+ExecStart=/usr/bin/node /path/to/nexusbot/src/index.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+# EnvironmentFile=/path/to/nexusbot/.env
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now nexusbot
+journalctl --user -u nexusbot -f
+```
+
+### Option B: PM2
+
+```
+npm install -g pm2
+pm2 start src/index.js --name nexusbot
+pm2 save
+pm2 startup
+```
+
+Tip: You can also tune `reconnectTimeoutMs` and `reconnectIntervalMs` in `config.json`
+to control Discord reconnect behavior.
+
 ## Prerequisites
 
 - Node.js 20+

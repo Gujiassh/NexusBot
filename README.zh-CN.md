@@ -8,6 +8,58 @@ NexusBot 是本地 Discord 桥接服务：可恢复 Codex CLI 会话，并将记
 
 运行一个轻量 Discord 机器人，把消息转发给本地 Codex CLI，可选启用白名单与审批，并将记忆写入 JSONL/Markdown。
 
+## 为什么是 NexusBot
+
+- 通过 Codex CLI 的缓存减少 Moltbot 的 token 消耗（具体节省与提供方/配置有关）。
+- 解决长时间运行掉线问题：本地 Node 服务 + 重连机制，并配合进程守护常驻。
+- 只接入 Discord，因为目前仅使用 Discord 作为主要沟通渠道。
+
+## 如何保证 NexusBot 常驻
+
+NexusBot 本质是一个 Node.js 进程。要长期稳定运行并在异常退出后自动拉起，
+建议使用 systemd 或 PM2 进行守护。
+
+### 方案 A：systemd（Linux 推荐）
+
+在 `~/.config/systemd/user/nexusbot.service` 新建服务文件：
+
+```
+[Unit]
+Description=NexusBot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/nexusbot
+ExecStart=/usr/bin/node /path/to/nexusbot/src/index.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+# EnvironmentFile=/path/to/nexusbot/.env
+
+[Install]
+WantedBy=default.target
+```
+
+启用并查看日志：
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now nexusbot
+journalctl --user -u nexusbot -f
+```
+
+### 方案 B：PM2
+
+```
+npm install -g pm2
+pm2 start src/index.js --name nexusbot
+pm2 save
+pm2 startup
+```
+
+提示：可在 `config.json` 中调整 `reconnectTimeoutMs` 和 `reconnectIntervalMs`
+来控制 Discord 的重连行为。
+
 ## 环境要求
 
 - Node.js 20+
