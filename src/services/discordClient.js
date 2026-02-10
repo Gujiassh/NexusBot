@@ -1,68 +1,63 @@
-import { Client, GatewayIntentBits, Partials } from "discord.js";
-
-export function createDiscordClient(cfg) {
-  const intents = [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
-  ];
-
-  if (cfg.allowedRoleIds?.length) {
-    intents.push(GatewayIntentBits.GuildMembers);
-  }
+export async function createDiscordClient(cfg, logger = console) {
+  const { Client, GatewayIntentBits, Partials } = await import("discord.js");
 
   const client = new Client({
-    intents,
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent,
+    ],
     partials: [Partials.Channel],
   });
 
-  client.once("ready", () => {
-    console.log(`discord connected as ${client.user?.tag || "unknown"}`);
+  client.once("clientReady", () => {
+    logger?.info?.("discord connected", {
+      botTag: client.user?.tag || "unknown",
+      botId: client.user?.id || "unknown",
+    });
   });
 
   client.on("shardDisconnect", (event, shardId) => {
-    console.warn(`discord shard ${shardId} disconnected`, event?.code);
+    logger?.warn?.("discord shard disconnected", {
+      shardId,
+      code: event?.code,
+      reason: event?.reason,
+    });
   });
 
   client.on("shardReconnecting", (shardId) => {
-    console.warn(`discord shard ${shardId} reconnecting`);
+    logger?.warn?.("discord shard reconnecting", { shardId });
   });
 
-  client.on("error", (err) => {
-    console.error("discord client error", err);
+  client.on("error", (error) => {
+    logger?.error?.("discord client error", {
+      error: error?.message || String(error),
+    });
   });
 
   return client;
 }
 
-export function checkAllowlist(message, cfg) {
-  if (!message?.content) return { allowed: false, reason: "empty_content" };
+export function isOwnerUser(userId, cfg) {
+  if (!userId || !cfg?.ownerUserId) return false;
+  return String(userId) === String(cfg.ownerUserId);
+}
+
+export function isDmContext(value) {
+  return value?.guildId == null;
+}
+
+export function checkMessageAccess(message, cfg) {
+  if (!message) return { allowed: false, reason: "missing_message" };
   if (message.author?.bot) return { allowed: false, reason: "bot_message" };
-  const ownerIds = Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : [];
-  if (ownerIds.length && message.author?.id && ownerIds.includes(message.author.id)) {
-    return { allowed: true, reason: "owner" };
-  }
-  const isDm = message.guildId == null;
-  if (isDm && cfg.allowDm === false) {
-    return { allowed: false, reason: "dm_disallowed" };
-  }
-  if (cfg.channelAllowlist?.length) {
-    if (!isDm && !cfg.channelAllowlist.includes(message.channelId)) {
-      return { allowed: false, reason: "channel_not_allowlisted" };
-    }
-  }
-  if (cfg.allowedUserIds?.length) {
-    if (!cfg.allowedUserIds.includes(message.author.id)) {
-      return { allowed: false, reason: "user_not_allowlisted" };
-    }
-  }
-  if (!isDm && cfg.allowedRoleIds?.length) {
-    const member = message.member;
-    const roleIds = member?.roles?.cache ? [...member.roles.cache.keys()] : [];
-    if (!roleIds.length) return { allowed: false, reason: "role_unavailable" };
-    const hasRole = cfg.allowedRoleIds.some((id) => roleIds.includes(id));
-    if (!hasRole) return { allowed: false, reason: "role_not_allowlisted" };
-  }
-  return { allowed: true };
+  if (!isOwnerUser(message.author?.id, cfg)) return { allowed: false, reason: "not_owner" };
+  if (!isDmContext(message)) return { allowed: false, reason: "not_dm" };
+  return { allowed: true, reason: "owner_dm" };
+}
+
+export function checkInteractionAccess(interaction, cfg) {
+  if (!interaction) return { allowed: false, reason: "missing_interaction" };
+  if (!isOwnerUser(interaction.user?.id, cfg)) return { allowed: false, reason: "not_owner" };
+  if (!isDmContext(interaction)) return { allowed: false, reason: "not_dm" };
+  return { allowed: true, reason: "owner_dm" };
 }

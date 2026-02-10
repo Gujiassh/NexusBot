@@ -1,1422 +1,635 @@
 import "dotenv/config";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import process from "node:process";
-import crypto from "node:crypto";
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 
-import { extractPrompt, hasCommandPrefix, usageMessage } from "./commands/codexCommand.js";
-import { runCodex } from "./services/codexRunner.js";
-import { runAgentsSdk, runApprovalCheck } from "./services/agentsRunner.js";
-import { loadConfig, updateConfigFile } from "./services/config.js";
-import { checkAllowlist, createDiscordClient } from "./services/discordClient.js";
-import { appendApproval, appendImportant, appendMemory, appendRejection } from "./services/memoryStore.js";
-import { findSessionById, listSessions } from "./services/sessions.js";
-import { registerSlashCommands } from "./services/slashCommands.js";
+import { COMMAND_NAMES } from "./commands/slashCommands.js";
+import { loadConfig } from "./services/config.js";
+import { CodexAppServerClient } from "./services/codexAppServerClient.js";
+import {
+  checkInteractionAccess,
+  checkMessageAccess,
+  createDiscordClient,
+} from "./services/discordClient.js";
 import { acquireInstanceLock } from "./services/instanceLock.js";
-import { loadThreadStore, saveThreadStore } from "./services/threadStore.js";
-import { listSkills } from "./services/skillList.js";
+import {
+  appendTaskEvent,
+  createLogger,
+  initializeRuntimeStore,
+  loadRuntimeState,
+  saveRuntimeState,
+} from "./services/runtimeStore.js";
+import { registerSlashCommands } from "./services/slashCommands.js";
+import { createTaskId, TaskQueue } from "./services/taskQueue.js";
 import { splitDiscordMessage } from "./utils/messageChunker.js";
 import { collectSecrets, redactText } from "./utils/redact.js";
-import { decideTaskRoute } from "./services/taskRouter.js";
-import { startCodexSweeper } from "./services/processSweeper.js";
-import {
-  createScheduler,
-  loadSchedules,
-  parseInterval,
-  formatInterval,
-} from "./services/scheduler.js";
-import { startMessageServer } from "./services/messageServer.js";
+
+const require = createRequire(import.meta.url);
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function formatDurationMs(startedAt) {
+  if (!startedAt) return "-";
+  const started = new Date(startedAt).valueOf();
+  if (Number.isNaN(started)) return "-";
+  const sec = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  return `${sec}s`;
+}
+
+function formatThreadPreview(entry) {
+  const id = entry?.id || "(unknown)";
+  const preview = String(entry?.preview || "").trim().replace(/\s+/g, " ");
+  if (!preview) return id;
+  return `${id} · ${preview.slice(0, 60)}`;
+}
+
+function buildStatusText(runtime, queue) {
+  const lines = [
+    "📊 Bridge Status",
+    `- app-server: ${runtime.appServerStatus || "unknown"}`,
+    `- discord: ${runtime.discordStatus || "unknown"}`,
+    `- thread: ${runtime.activeThreadId || "(none)"}`,
+    `- running task: ${runtime.activeTaskId || "(none)"}`,
+    `- running turn: ${runtime.activeTurnId || "(none)"}`,
+    `- queue length: ${queue.size}`,
+    `- running duration: ${formatDurationMs(runtime.activeTaskStartedAt)}`,
+  ];
+
+  if (runtime.lastError?.message) {
+    lines.push(`- last error: ${runtime.lastError.message}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildLiveText(taskId, textOutput, cmdOutput, minPreviewChars) {
+  const cleanedText = String(textOutput || "");
+  const cleanedCmd = String(cmdOutput || "");
+
+  if (!cleanedText && !cleanedCmd) {
+    return `⏳ #${taskId} 任务执行中...`;
+  }
+
+  let merged = cleanedText;
+  if (cleanedCmd) {
+    const cmdTail = cleanedCmd.slice(-Math.max(minPreviewChars / 2, 300));
+    merged = `${merged}\n\n--- command output tail ---\n${cmdTail}`;
+  }
+
+  const tail = merged.slice(-Math.max(minPreviewChars, 1200));
+  return `⏳ #${taskId} 执行中（流式预览）\n\n${tail}`;
+}
+
+async function replyChunks(sendFn, content) {
+  const chunks = splitDiscordMessage(content, 1900);
+  for (const chunk of chunks) {
+    await sendFn(chunk);
+  }
+}
+
+function createInteractionSource(interaction) {
+  return {
+    sourceType: "slash",
+    userId: interaction.user?.id,
+    channelId: interaction.channelId,
+    interactionId: interaction.id,
+    async ack(content) {
+      if (!interaction.deferred && !interaction.replied) {
+        return interaction.reply({ content, fetchReply: true });
+      }
+      return interaction.followUp({ content, fetchReply: true });
+    },
+    async send(content) {
+      if (!interaction.deferred && !interaction.replied) {
+        return interaction.reply({ content, fetchReply: true });
+      }
+      return interaction.followUp({ content, fetchReply: true });
+    },
+  };
+}
+
+function createMessageSource(message) {
+  return {
+    sourceType: "dm_text",
+    userId: message.author?.id,
+    channelId: message.channelId,
+    messageId: message.id,
+    async ack(content) {
+      return message.reply(content);
+    },
+    async send(content) {
+      return message.channel.send(content);
+    },
+  };
+}
+
+function redactProxyUrl(proxyUrl) {
+  if (!proxyUrl) return proxyUrl;
+  return String(proxyUrl).replace(/:\/\/[^@]*@/, "://***@");
+}
+
+function getProxyUrlFromEnv() {
+  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || null;
+}
+
+function configureProxyDispatcher(logger) {
+  const proxyUrl = getProxyUrlFromEnv();
+  if (!proxyUrl) return null;
+
+  try {
+    setGlobalDispatcher(new ProxyAgent(proxyUrl));
+    logger?.info?.("proxy dispatcher enabled", { proxy: redactProxyUrl(proxyUrl) });
+    return proxyUrl;
+  } catch (error) {
+    logger?.warn?.("failed to enable proxy dispatcher", {
+      error: error?.message || String(error),
+    });
+    return null;
+  }
+}
+
+async function configureDiscordGatewayProxy(logger, proxyUrl) {
+  if (!proxyUrl) return false;
+
+  try {
+    const wsModule = require("ws");
+    if (wsModule.__nexusGatewayProxyPatched) {
+      return true;
+    }
+
+    const { HttpsProxyAgent } = await import("https-proxy-agent");
+    const proxyAgent = new HttpsProxyAgent(proxyUrl);
+    const OriginalWebSocket = wsModule.WebSocket;
+
+    class ProxyWebSocket extends OriginalWebSocket {
+      constructor(address, protocols, options) {
+        if (options === undefined && protocols && typeof protocols === "object" && !Array.isArray(protocols)) {
+          const mergedOptions = {
+            ...protocols,
+            agent: protocols.agent || proxyAgent,
+          };
+          super(address, mergedOptions);
+          return;
+        }
+
+        const mergedOptions = {
+          ...(options || {}),
+          agent: options?.agent || proxyAgent,
+        };
+        super(address, protocols, mergedOptions);
+      }
+    }
+
+    wsModule.WebSocket = ProxyWebSocket;
+    wsModule.default = ProxyWebSocket;
+    wsModule.__nexusGatewayProxyPatched = true;
+    logger?.info?.("discord gateway proxy enabled", {
+      proxy: redactProxyUrl(proxyUrl),
+    });
+    return true;
+  } catch (error) {
+    logger?.warn?.("failed to enable discord gateway proxy", {
+      error: error?.message || String(error),
+    });
+    return false;
+  }
+}
+
+async function runStartupDiagnostics(cfg) {
+  const probe = spawnSync(cfg.codexCommand, ["--help"], {
+    cwd: cfg.codexCwd,
+    encoding: "utf8",
+  });
+
+  if (probe.error) {
+    throw new Error(`Codex CLI unavailable: ${probe.error.message}`);
+  }
+
+  if (typeof probe.status === "number" && probe.status !== 0) {
+    const stderr = String(probe.stderr || "").slice(0, 300);
+    throw new Error(`Codex CLI check failed with status ${probe.status}: ${stderr}`);
+  }
+}
 
 async function main() {
   const cfg = await loadConfig();
-  const approvalRules = buildApprovalRules(cfg);
-  const approvalAllowlist = buildApprovalAllowlist(cfg);
-  await acquireInstanceLock(cfg);
-  const client = createDiscordClient(cfg);
+  await initializeRuntimeStore(cfg);
+
   const secrets = collectSecrets(cfg);
-  const agentThreads = await loadThreadStore(cfg.agentsThreadsFile);
-  const userSessions = await loadThreadStore(cfg.userSessionsFile);
-  const schedules = await loadSchedules(cfg.schedulesFile);
-  const scheduler = createScheduler(client, cfg, schedules);
-  startCodexSweeper(cfg);
+  const logger = createLogger(cfg, secrets);
 
-  const queue = [];
-  const pendingApprovals = new Map();
-  const activeRuns = new Map();
-  let reconnecting = false;
-  let lastDisconnectAt;
+  const proxyUrl = configureProxyDispatcher(logger);
+  await configureDiscordGatewayProxy(logger, proxyUrl);
 
-  function extractImportantNote(content) {
-    if (!content) return null;
-    const trimmed = content.trim();
-    const candidates = [];
-    if (hasCommandPrefix(trimmed, cfg.commandPrefix)) {
-      const afterPrefix = trimmed.slice(cfg.commandPrefix.length).trim();
-      candidates.push(afterPrefix);
-    }
-    candidates.push(trimmed);
+  await runStartupDiagnostics(cfg);
+  await acquireInstanceLock(cfg);
 
-    for (const candidate of candidates) {
-      for (const keyword of cfg.importantKeywords || []) {
-        if (!keyword) continue;
-        if (candidate.startsWith(keyword)) {
-          let note = candidate.slice(keyword.length).trim();
-          note = note.replace(/^[:：\-—]+/, "").trim();
-          return { keyword, note };
+  let runtime = await loadRuntimeState(cfg);
+
+  const persistRuntime = async (patch = {}) => {
+    runtime = {
+      ...runtime,
+      ...patch,
+      updatedAt: nowIso(),
+    };
+    runtime = await saveRuntimeState(cfg, runtime);
+    return runtime;
+  };
+
+  const queue = new TaskQueue({
+    onStateChange: async ({ queueLength, activeTask }) => {
+      const patch = { queueLength };
+      if (!activeTask) {
+        if (!runtime.activeTurnId) {
+          patch.activeTaskId = null;
+          patch.activeTaskStartedAt = null;
         }
       }
+      await persistRuntime(patch);
+    },
+  });
+
+  const appServer = new CodexAppServerClient(cfg, logger);
+  let cancelRequestedTaskId = null;
+
+  appServer.on("notification", (notification) => {
+    const method = notification?.method;
+    if (!method) return;
+    const known = new Set([
+      "turn/started",
+      "item/agentMessage/delta",
+      "item/commandExecution/outputDelta",
+      "turn/completed",
+      "error",
+    ]);
+    if (!known.has(method)) {
+      logger.debug("ignored app-server notification", { method });
     }
-    return null;
-  }
+  });
 
-  function shouldAutoReply(message) {
-    const isDm = message.guildId == null;
-    if (isDm) return cfg.autoReplyInDm;
-    if (cfg.autoReplyInChannels) return true;
-    if (cfg.mentionReplyInChannels && isBotMention(message)) return true;
-    return false;
-  }
+  appServer.on("needs-restart", async ({ code, signal }) => {
+    await persistRuntime({
+      appServerStatus: "restarting",
+      lastError: {
+        at: nowIso(),
+        message: `app-server exited code=${code} signal=${signal}`,
+      },
+    });
 
-  function isBotMention(message) {
-    if (!message || !client.user) return false;
     try {
-      return Boolean(message.mentions?.has?.(client.user));
+      await appServer.start();
+      await persistRuntime({ appServerStatus: "ready" });
+    } catch (error) {
+      await persistRuntime({
+        appServerStatus: "down",
+        lastError: {
+          at: nowIso(),
+          message: redactText(error?.message || String(error), secrets),
+        },
+      });
+    }
+  });
+
+  await appServer.start();
+
+  if (runtime.activeThreadId) {
+    try {
+      const resumed = await appServer.resumeThread(runtime.activeThreadId);
+      await persistRuntime({
+        appServerStatus: "ready",
+        activeThreadId: resumed?.id || runtime.activeThreadId,
+      });
     } catch {
-      return false;
-    }
-  }
-
-  function stripBotMention(content) {
-    if (!content || !client.user) return content || "";
-    const id = client.user.id;
-    const pattern = new RegExp(`<@!?${id}>`, "g");
-    return String(content).replace(pattern, "").trim();
-  }
-
-  function formatTimestamp(value, fallbackMs) {
-    const fromValue = value ? new Date(value) : null;
-    if (fromValue && !Number.isNaN(fromValue.valueOf())) {
-      return fromValue.toISOString().replace("T", " ").replace("Z", "Z");
-    }
-    if (fallbackMs) {
-      const fromMs = new Date(fallbackMs);
-      if (!Number.isNaN(fromMs.valueOf())) {
-        return fromMs.toISOString().replace("T", " ").replace("Z", "Z");
-      }
-    }
-    return "unknown";
-  }
-
-  function formatSessionLine(session, index) {
-    const id = session.id || "(unknown)";
-    const ts = formatTimestamp(session.timestamp, session.mtimeMs);
-    const cwd = session.cwd || "-";
-    return `${index + 1}) ${id} | ${ts} | ${cwd}`;
-  }
-
-  function shouldForceTask(prompt) {
-    const text = String(prompt || "");
-    if (!text) return false;
-    if (cfg.taskRoutingMinChars && text.length >= cfg.taskRoutingMinChars) return true;
-    const lower = text.toLowerCase();
-    for (const keyword of cfg.taskRoutingKeywords || []) {
-      if (!keyword) continue;
-      if (lower.includes(String(keyword).toLowerCase())) return true;
-    }
-    return false;
-  }
-
-  function checkDenylist(prompt) {
-    const text = String(prompt || "");
-    if (!text) return null;
-    const lower = text.toLowerCase();
-    for (const keyword of cfg.safetyDenylistKeywords || []) {
-      if (!keyword) continue;
-      const k = String(keyword).toLowerCase();
-      if (k && lower.includes(k)) {
-        return keyword;
-      }
-    }
-    return null;
-  }
-
-  function buildApprovalComponents(requestId, disabled = false) {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`approval:approve:${requestId}`)
-          .setLabel("批准")
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(disabled),
-        new ButtonBuilder()
-          .setCustomId(`approval:reject:${requestId}`)
-          .setLabel("拒绝")
-          .setStyle(ButtonStyle.Danger)
-          .setDisabled(disabled)
-      ),
-    ];
-  }
-
-  function isOwnerMessage(message) {
-    const ownerIds = Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : [];
-    if (!ownerIds.length) return false;
-    return message?.author?.id && ownerIds.includes(message.author.id);
-  }
-
-  function isSlashCommandMessage(message) {
-    return typeof message?.content === "string" && message.content.trim().startsWith("/");
-  }
-
-  function shorten(text, max = 200) {
-    const raw = String(text || "");
-    if (!raw) return "";
-    if (raw.length <= max) return raw;
-    return `${raw.slice(0, max)}…`;
-  }
-
-  function escapeRegExp(value) {
-    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  function asStringArray(value) {
-    if (!Array.isArray(value)) return [];
-    return value.map((item) => String(item)).filter(Boolean);
-  }
-
-  function compilePatterns(patterns) {
-    const compiled = [];
-    for (const rawPattern of patterns || []) {
-      if (!rawPattern) continue;
-      const pattern = String(rawPattern);
-      if (pattern.startsWith("/") && pattern.lastIndexOf("/") > 0) {
-        const lastSlash = pattern.lastIndexOf("/");
-        const body = pattern.slice(1, lastSlash);
-        const flags = pattern.slice(lastSlash + 1) || "i";
-        try {
-          compiled.push({ raw: pattern, regex: new RegExp(body, flags) });
-          continue;
-        } catch {
-          // fall through to literal match
-        }
-      }
-      compiled.push({ raw: pattern, literal: pattern.toLowerCase() });
-    }
-    return compiled;
-  }
-
-  function matchCompiledPatterns(text, compiled) {
-    const raw = String(text || "");
-    if (!raw) return null;
-    const lower = raw.toLowerCase();
-    for (const entry of compiled || []) {
-      if (entry.regex) {
-        if (entry.regex.test(raw)) return entry.raw;
-      } else if (entry.literal) {
-        if (lower.includes(entry.literal)) return entry.raw;
-      }
-    }
-    return null;
-  }
-
-  function buildApprovalRules(cfg) {
-    const defaults = {
-      commandKeywords: [
-        "ls",
-        "cat",
-        "rm",
-        "mv",
-        "cp",
-        "chmod",
-        "chown",
-        "sudo",
-        "curl",
-        "wget",
-        "ssh",
-        "scp",
-        "git",
-        "docker",
-        "ps",
-        "kill",
-        "pkill",
-        "systemctl",
-        "service",
-        "nohup",
-        "bash",
-        "sh",
-        "python",
-        "node",
-      ],
-      pathPatterns: [
-        "/(^|\\s)(~\\/|\\.\\/|\\.\\.\\/|\\/|[A-Za-z]:\\\\|\\\\\\\\)/",
-      ],
-      denyPatterns: [],
-    };
-    const raw = cfg?.approvalRules && typeof cfg.approvalRules === "object"
-      ? cfg.approvalRules
-      : {};
-    const commandKeywords =
-      raw.commandKeywords === undefined
-        ? defaults.commandKeywords
-        : asStringArray(raw.commandKeywords);
-    const pathPatterns =
-      raw.pathPatterns === undefined
-        ? defaults.pathPatterns
-        : asStringArray(raw.pathPatterns);
-    const denyPatterns =
-      raw.denyPatterns === undefined
-        ? defaults.denyPatterns
-        : asStringArray(raw.denyPatterns);
-    const commandRegex =
-      commandKeywords.length > 0
-        ? new RegExp(
-            `\\b(?:${commandKeywords.map(escapeRegExp).join("|")})\\b`,
-            "i"
-          )
-        : null;
-    return {
-      commandKeywords,
-      commandRegex,
-      pathPatterns: compilePatterns(pathPatterns),
-      denyPatterns: compilePatterns(denyPatterns),
-    };
-  }
-
-  function buildApprovalAllowlist(cfg) {
-    return {
-      userIds: asStringArray(cfg?.approvalAllowlistUserIds),
-      roleIds: asStringArray(cfg?.approvalAllowlistRoleIds),
-      channelIds: asStringArray(cfg?.approvalAllowlistChannelIds),
-      guildIds: asStringArray(cfg?.approvalAllowlistGuildIds),
-      patterns: compilePatterns(asStringArray(cfg?.approvalAllowlistPatterns)),
-    };
-  }
-
-  function extractRoleIds(member) {
-    if (!member) return [];
-    const roles = member.roles;
-    if (!roles) return [];
-    if (Array.isArray(roles)) {
-      return roles
-        .map((role) => (typeof role === "string" ? role : role?.id))
-        .filter(Boolean);
-    }
-    if (roles.cache && typeof roles.cache.keys === "function") {
-      return Array.from(roles.cache.keys());
-    }
-    return [];
-  }
-
-  function isApprovalWhitelisted(actor, prompt) {
-    if (!actor) return null;
-    const authorId = actor?.author?.id;
-    if (authorId && approvalAllowlist.userIds.includes(authorId)) {
-      return `user:${authorId}`;
-    }
-    const channelId = actor?.channelId;
-    if (channelId && approvalAllowlist.channelIds.includes(channelId)) {
-      return `channel:${channelId}`;
-    }
-    const guildId = actor?.guildId;
-    if (guildId && approvalAllowlist.guildIds.includes(guildId)) {
-      return `guild:${guildId}`;
-    }
-    const roleIds = extractRoleIds(actor?.member);
-    if (roleIds.some((roleId) => approvalAllowlist.roleIds.includes(roleId))) {
-      return "role";
-    }
-    const patternMatch = matchCompiledPatterns(prompt, approvalAllowlist.patterns);
-    if (patternMatch) {
-      return `pattern:${patternMatch}`;
-    }
-    return null;
-  }
-
-  function matchCommandKeyword(text) {
-    if (!approvalRules.commandRegex) return null;
-    const match = String(text || "").match(approvalRules.commandRegex);
-    return match ? match[0] : null;
-  }
-
-  function localRiskCheck(prompt, { isCommand, isImportant } = {}) {
-    const reasons = [];
-    if (isCommand) reasons.push("command");
-    if (isImportant) reasons.push("important");
-    const text = String(prompt || "");
-    const denyMatch = matchCompiledPatterns(text, approvalRules.denyPatterns);
-    if (denyMatch) {
-      reasons.push(`rule:deny:${denyMatch}`);
-    }
-    const pathMatch = matchCompiledPatterns(text, approvalRules.pathPatterns);
-    const commandMatch = matchCommandKeyword(text);
-    if (pathMatch || commandMatch) {
-      reasons.push("file_or_command");
-      if (commandMatch) {
-        reasons.push(`rule:command:${commandMatch}`);
-      }
-      if (pathMatch) {
-        reasons.push("rule:path");
-      }
-    }
-    return { needsApproval: reasons.length > 0, reasons, evidence: shorten(text) };
-  }
-
-  async function evaluateRisk(prompt, { isCommand, isImportant, actor } = {}) {
-    const denyMatch = checkDenylist(prompt);
-    if (denyMatch) {
-      return {
-        needsApproval: true,
-        reasons: [`denylist:${denyMatch}`],
-        evidence: shorten(prompt),
-        forceReject: cfg.safetyDenylistReject === true,
-      };
-    }
-    const allowMatch = isApprovalWhitelisted(actor, prompt);
-    if (allowMatch) {
-      return {
-        needsApproval: false,
-        reasons: [`allowlist:${allowMatch}`],
-        evidence: shorten(prompt),
-      };
-    }
-    const base = localRiskCheck(prompt, { isCommand, isImportant });
-    if (base.needsApproval || !cfg.approvalUseModel) return base;
-    try {
-      const ai = await runApprovalCheck(cfg, prompt);
-      if (ai.needsApproval) {
-        return {
-          needsApproval: true,
-          reasons: [ai.reason ? `model:${ai.reason}` : "model"],
-          evidence: ai.highlight ? shorten(ai.highlight) : base.evidence,
-        };
-      }
-    } catch (err) {
-      console.warn("approval model check failed", err?.message || err);
-      return {
-        needsApproval: true,
-        reasons: ["model_error"],
-        evidence: base.evidence,
-      };
-    }
-    return base;
-  }
-
-  async function sendOwnerNotice(messageText, components) {
-    const ownerIds = Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : [];
-    if (!ownerIds.length) return;
-    let notified = false;
-    if (cfg.adminChannelId) {
-      try {
-        const channel = await client.channels.fetch(cfg.adminChannelId);
-        if (channel?.isTextBased()) {
-          const sent = await channel.send({ content: messageText, components });
-          notified = true;
-          return sent;
-        }
-      } catch (err) {
-        console.warn("notify owner channel failed", err?.message || err);
-      }
-    }
-    if (!notified) {
-      for (const ownerId of ownerIds) {
-        try {
-          const ownerUser = await client.users.fetch(ownerId);
-          const sent = await ownerUser.send({ content: messageText, components });
-          if (sent) return sent;
-        } catch (err) {
-          console.warn("notify owner dm failed", err?.message || err);
-        }
-      }
-    }
-    return null;
-  }
-
-  async function requestOwnerApproval({ message, prompt, kind, reasons, evidence }) {
-    const requestId = crypto.randomUUID();
-    const safeReasons = Array.isArray(reasons) ? reasons : [];
-    const entry = {
-      id: requestId,
-      ts: new Date().toISOString(),
-      status: "pending",
-      reasons: safeReasons,
-      evidence,
-      kind,
-      discord: {
-        channelId: message.channelId,
-        messageId: message.id,
-        authorId: message.author?.id,
-        authorTag: message.author?.tag,
-        content: message.content,
-      },
-    };
-    const isDm = message.guildId == null;
-    const channelInfo = isDm ? "DM" : `channel:${message.channelId}`;
-    const noticeLines = [
-      "审批请求",
-      `id: ${requestId}`,
-      `user: ${message.author?.tag || message.author?.id} (${message.author?.id})`,
-      `where: ${channelInfo}`,
-      `content: ${message.content}`,
-      `操作: ${cfg.commandPrefix} approve ${requestId} / ${cfg.commandPrefix} reject ${requestId}`,
-    ].filter(Boolean);
-    if (isDm) {
-      noticeLines.push(`私聊提醒: 用户id：${message.author?.id} 请求：${message.content}`);
-    }
-    const ownerNotice = noticeLines.join("\n");
-    const noticeMessage = await sendOwnerNotice(
-      ownerNotice,
-      buildApprovalComponents(requestId)
-    );
-
-    pendingApprovals.set(requestId, {
-      request: entry,
-      message,
-      prompt,
-      receivedAt: entry.ts,
-      approvalMessage: noticeMessage
-        ? { channelId: noticeMessage.channelId, messageId: noticeMessage.id }
-        : null,
-    });
-    await appendApproval(cfg, entry);
-
-    try {
-      await message.reply({ content: "已提交给主人审核，请稍等。" });
-    } catch {
-      // ignore
-    }
-  }
-
-  async function updateApprovalNotice(record, status, decidedBy) {
-    const ref = record?.approvalMessage;
-    if (!ref) return;
-    try {
-      const channel = await client.channels.fetch(ref.channelId);
-      if (!channel?.isTextBased()) return;
-      const msg = await channel.messages.fetch(ref.messageId);
-      const suffix = `\n状态: ${status}${decidedBy ? ` by ${decidedBy}` : ""}`;
-      const content = msg.content.includes("状态:")
-        ? msg.content
-        : `${msg.content}${suffix}`;
-      await msg.edit({
-        content,
-        components: buildApprovalComponents(record.request.id, true),
+      const thread = await appServer.startThread();
+      await persistRuntime({
+        appServerStatus: "ready",
+        activeThreadId: thread?.id || null,
       });
-    } catch (err) {
-      console.warn("update approval notice failed", err?.message || err);
     }
-  }
-
-  async function executeApprovedRecord(record, decisionBy) {
-    if (!record?.request) return;
-    const kind = record.request.kind || "prompt";
-    if (kind === "command") {
-      try {
-        await handleBotCommand(record.message, record.prompt, { approved: true });
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        try {
-          await record.message.reply({ content: `command error: ${errorText}` });
-        } catch {
-          // ignore
-        }
-      }
-      return;
-    }
-    if (kind === "important") {
-      const importantMatch = extractImportantNote(record.message?.content || "");
-      if (!importantMatch || !importantMatch.note) {
-        try {
-          await record.message.reply({ content: "未能解析重要内容，请重新发送（记住/记一下/记录）" });
-        } catch {
-          // ignore
-        }
-        return;
-      }
-      const entry = {
-        ts: new Date().toISOString(),
-        keyword: importantMatch.keyword,
-        note: importantMatch.note,
-        discord: {
-          channelId: record.message.channelId,
-          messageId: record.message.id,
-          authorId: record.message.author?.id,
-          authorTag: record.message.author?.tag,
-          content: record.message.content,
-        },
-      };
-      await appendImportant(cfg, entry);
-      try {
-        await record.message.reply({ content: cfg.importantReply });
-      } catch {
-        // ignore
-      }
-      return;
-    }
-
-    queue.push({
-      message: record.message,
-      prompt: record.prompt,
-      receivedAt: record.receivedAt,
-      ackedAt: new Date().toISOString(),
-      kind: record.request?.kind || "prompt",
-      taskId: record.request?.taskId,
+  } else {
+    const thread = await appServer.startThread();
+    await persistRuntime({
+      appServerStatus: "ready",
+      activeThreadId: thread?.id || null,
     });
-    processQueue();
   }
 
-  async function finalizeApproval(record, decision, decidedBy) {
-    const logEntry = {
-      ...record.request,
-      status: decision,
-      decidedAt: new Date().toISOString(),
-      decidedBy,
-    };
-    await appendApproval(cfg, logEntry);
-    await updateApprovalNotice(record, decision, decidedBy);
+  const client = await createDiscordClient(cfg, logger);
 
-    if (decision !== "approved") {
-      try {
-        await record.message.reply({ content: "主人已拒绝该请求。" });
-      } catch {
-        // ignore
-      }
+  async function submitTask(prompt, source) {
+    const inputText = String(prompt || "").trim();
+    if (!inputText) {
+      await source.send("❌ 输入不能为空");
       return;
     }
 
-    await executeApprovedRecord(record, decidedBy);
-  }
+    if (!runtime.activeThreadId) {
+      const thread = await appServer.startThread();
+      await persistRuntime({ activeThreadId: thread?.id || null });
+    }
 
-  function buildInteractionAdapter(interaction, prompt, deferred) {
-    let responded = false;
-    return {
-      channel: interaction.channel,
-      channelId: interaction.channelId,
-      guildId: interaction.guildId,
-      member: interaction.member,
-      author: interaction.user,
-      id: interaction.id,
-      content: prompt,
-      reply: async ({ content }) => {
-        if (!responded) {
-          if (deferred) {
-            await interaction.editReply({ content });
-          } else {
-            await interaction.reply({ content });
-          }
-          responded = true;
-          return;
+    const taskId = createTaskId();
+    const taskBase = {
+      taskId,
+      sourceType: source.sourceType,
+      sourceMessageId: source.messageId || null,
+      sourceInteractionId: source.interactionId || null,
+      userId: source.userId,
+      channelId: source.channelId,
+      inputText,
+      threadId: runtime.activeThreadId,
+      createdAt: nowIso(),
+    };
+
+    await appendTaskEvent(cfg, {
+      ...taskBase,
+      status: "queued",
+    }, secrets);
+
+    const ackText = `${cfg.ackMessage} #${taskId}`;
+    const ackMessage = await source.ack(ackText);
+
+    return queue.enqueue({ taskId }, async () => {
+      await persistRuntime({
+        activeTaskId: taskId,
+        activeTaskStartedAt: nowIso(),
+      });
+
+      await appendTaskEvent(cfg, {
+        ...taskBase,
+        status: "running",
+        startedAt: nowIso(),
+      }, secrets);
+
+      let liveText = "";
+      let commandText = "";
+      let lastRendered = "";
+      let streamTimer = null;
+
+      const flushStream = async (force = false) => {
+        const rendered = buildLiveText(taskId, liveText, commandText, cfg.minStreamPreviewChars);
+        if (!force && rendered === lastRendered) return;
+        lastRendered = rendered;
+
+        try {
+          await ackMessage.edit(rendered);
+        } catch {
         }
-        await interaction.followUp({ content });
-      },
-    };
-  }
+      };
 
-  async function handleInteractionCommand(interaction) {
-    if (!interaction.isChatInputCommand()) return;
-    const name = interaction.commandName;
-    if (!["approvals", "compact", "skill", "skill-creator", "new", "resume", "fork"].includes(name)) return;
+      const scheduleStreamFlush = () => {
+        if (streamTimer) return;
+        streamTimer = setTimeout(async () => {
+          streamTimer = null;
+          await flushStream(false);
+        }, cfg.streamUpdateIntervalMs);
+      };
 
-    if (!isOwnerMessage({ author: interaction.user })) {
-      await interaction.reply({ content: "无权限", ephemeral: true });
-      return;
-    }
-
-    if (name === "skill") {
-      const skills = await listSkills();
-      if (!skills.length) {
-        await interaction.reply({ content: "未找到本地 skills。" });
-        return;
-      }
-      const lines = skills.map(
-        (skill) => `- ${skill.name}: ${skill.description} (${skill.path})`
-      );
-      const content = `Skills (${skills.length}):\n${lines.join("\n")}`;
-      if (content.length > 1900) {
-        await interaction.reply({ content: `Skills (${skills.length}) 列表过长，请在命令行查看。` });
-      } else {
-        await interaction.reply({ content });
-      }
-      return;
-    }
-
-    const prompt = name === "skill-creator" ? "$skill-creator" : `/${name}`;
-    const allowResult = checkAllowlist(
-      {
-        content: prompt,
-        author: interaction.user,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        member: interaction.member,
-      },
-      cfg
-    );
-
-    if (!allowResult.allowed) {
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "当前频道/用户未授权", ephemeral: true });
-      }
-      if (cfg.logRejections) {
-        const entry = {
-          ts: new Date().toISOString(),
-          reason: allowResult.reason,
-          commandPrefix: cfg.commandPrefix,
-          kind: "slash-command",
-          discord: {
-            channelId: interaction.channelId,
-            messageId: interaction.id,
-            authorId: interaction.user?.id,
-            authorTag: interaction.user?.tag,
-            content: prompt,
+      try {
+        const result = await appServer.runTurn({
+          threadId: runtime.activeThreadId,
+          inputText,
+          timeoutMs: cfg.turnTimeoutMs,
+          onTurnStarted: async (turnId) => {
+            await persistRuntime({
+              activeTurnId: turnId,
+              activeTaskId: taskId,
+              activeTaskStartedAt: runtime.activeTaskStartedAt || nowIso(),
+            });
           },
-        };
-        await appendRejection(cfg, entry);
-      }
-      return;
-    }
-
-    const adapter = buildInteractionAdapter(interaction, prompt, false);
-    if (cfg.requireOwnerApproval && !isOwnerMessage(adapter)) {
-      const { needsApproval, reasons, evidence, forceReject } = await evaluateRisk(prompt, {
-        isCommand: true,
-        actor: adapter,
-      });
-      if (needsApproval) {
-        if (forceReject) {
-          await interaction.reply({ content: "已拒绝：安全限制", ephemeral: true });
-          return;
-        }
-        await requestOwnerApproval({
-          message: adapter,
-          prompt,
-          kind: "slash-command",
-          reasons,
-          evidence,
-        });
-        return;
-      }
-    }
-
-    let ackedAt;
-    if (cfg.immediateAck) {
-      try {
-        await interaction.reply({ content: cfg.ackMessage });
-        ackedAt = new Date().toISOString();
-      } catch {
-        ackedAt = undefined;
-      }
-    } else {
-      try {
-        await interaction.deferReply();
-        ackedAt = new Date().toISOString();
-      } catch {
-        ackedAt = undefined;
-      }
-    }
-
-    const adapterDeferred = buildInteractionAdapter(
-      interaction,
-      prompt,
-      !cfg.immediateAck
-    );
-    queue.push({
-      message: adapterDeferred,
-      prompt,
-      receivedAt: new Date().toISOString(),
-      ackedAt,
-      kind: "slash-command",
-    });
-    processQueue();
-  }
-
-  async function handleBotCommand(message, commandText, options = {}) {
-    const trimmed = (commandText || "").trim();
-    if (!trimmed) {
-      await message.reply({ content: usageMessage(cfg.commandPrefix) });
-      return true;
-    }
-    const parts = trimmed.split(/\s+/).filter(Boolean);
-    const verb = (parts[0] || "").toLowerCase();
-    if (verb === "owners") {
-      if (!isOwnerMessage(message) && !options.approved) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      const owners = Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : [];
-      if (!owners.length) {
-        await message.reply({ content: "当前没有主人配置。" });
-        return true;
-      }
-      await message.reply({
-        content: `当前主人列表：\n${owners.join("\n")}`,
-      });
-      return true;
-    }
-    if (verb === "owner") {
-      if (!isOwnerMessage(message) && !options.approved) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      const action = (parts[1] || "").toLowerCase();
-      const targetId = parts[2];
-      if (!action || !targetId) {
-        await message.reply({
-          content: `用法: ${cfg.commandPrefix} owner add <id> / ${cfg.commandPrefix} owner remove <id>`,
-        });
-        return true;
-      }
-      const owners = new Set(Array.isArray(cfg.ownerUserIds) ? cfg.ownerUserIds : []);
-      if (action === "add") {
-        owners.add(targetId);
-      } else if (action === "remove") {
-        owners.delete(targetId);
-      } else {
-        await message.reply({
-          content: `用法: ${cfg.commandPrefix} owner add <id> / ${cfg.commandPrefix} owner remove <id>`,
-        });
-        return true;
-      }
-      const nextOwners = [...owners];
-      await updateConfigFile({ ownerUserIds: nextOwners });
-      cfg.ownerUserIds = nextOwners;
-      await message.reply({ content: `已更新主人列表：\n${nextOwners.join("\n")}` });
-      return true;
-    }
-    if (verb === "task") {
-      if (!isOwnerMessage(message) && !options.approved) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      const taskPrompt = parts.slice(1).join(" ").trim();
-      if (!taskPrompt) {
-        await message.reply({ content: `用法: ${cfg.commandPrefix} task <任务内容>` });
-        return true;
-      }
-      const taskId = crypto.randomUUID().slice(0, 8);
-      const receivedAt = new Date().toISOString();
-      queue.push({
-        message,
-        prompt: taskPrompt,
-        receivedAt,
-        ackedAt: receivedAt,
-        kind: "task",
-        taskId,
-      });
-      processQueue();
-      await message.reply({ content: `任务已派发：${taskId}` });
-      return true;
-    }
-    if (verb === "schedule") {
-      if (!isOwnerMessage(message) && !options.approved) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      const action = (parts[1] || "").toLowerCase();
-      if (action === "list") {
-        const items = scheduler.list();
-        if (!items.length) {
-          await message.reply({ content: "当前没有定时消息。" });
-          return true;
-        }
-        const lines = items.map((item) => {
-          const interval = formatInterval(item.intervalMs || 0);
-          const preview = String(item.message || "").slice(0, 60);
-          return `${item.id} | ${item.channelId} | ${interval} | ${preview}`;
-        });
-        for (const chunk of splitDiscordMessage(lines.join("\n"))) {
-          await message.reply({ content: chunk });
-        }
-        return true;
-      }
-      if (action === "remove") {
-        const id = parts[2];
-        if (!id) {
-          await message.reply({ content: `用法: ${cfg.commandPrefix} schedule remove <id>` });
-          return true;
-        }
-        const ok = await scheduler.remove(id);
-        await message.reply({ content: ok ? `已移除 ${id}` : "未找到该定时任务" });
-        return true;
-      }
-      if (action === "add") {
-        const channelArg = parts[2];
-        const intervalArg = parts[3];
-        const messageText = parts.slice(4).join(" ").trim();
-        if (!channelArg || !intervalArg || !messageText) {
-          await message.reply({
-            content: `用法: ${cfg.commandPrefix} schedule add <channelId|here> <interval> <message>`,
-          });
-          return true;
-        }
-        const channelId =
-          channelArg === "here"
-            ? message.channelId
-            : channelArg.replace(/[<#>]/g, "");
-        if (!channelId || channelId.length < 5) {
-          await message.reply({ content: "channelId 无效" });
-          return true;
-        }
-        const intervalMs = parseInterval(intervalArg);
-        if (!intervalMs) {
-          await message.reply({ content: "interval 格式不对，示例：10m / 1h / 30s" });
-          return true;
-        }
-        const id = crypto.randomUUID().slice(0, 8);
-        await scheduler.add({
-          id,
-          channelId,
-          intervalMs,
-          message: messageText,
-        });
-        await message.reply({
-          content: `已创建定时消息 ${id}（${formatInterval(intervalMs)}）`,
-        });
-        return true;
-      }
-      await message.reply({
-        content: `用法: ${cfg.commandPrefix} schedule add <channelId|here> <interval> <message>`,
-      });
-      return true;
-    }
-    if (verb === "pending") {
-      if (!isOwnerMessage(message)) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      if (!pendingApprovals.size) {
-        await message.reply({ content: "当前没有待审批请求。" });
-        return true;
-      }
-      const lines = [];
-      for (const [id, record] of pendingApprovals.entries()) {
-        const requester = record?.request?.discord?.authorTag || record?.request?.discord?.authorId;
-        const content = record?.request?.discord?.content
-          ? shorten(record.request.discord.content, 80)
-          : "-";
-        lines.push(`${id} | ${requester} | ${content}`);
-      }
-      for (const chunk of splitDiscordMessage(lines.join("\n"))) {
-        await message.reply({ content: chunk });
-      }
-      return true;
-    }
-    if (verb === "approve" || verb === "reject") {
-      if (!isOwnerMessage(message)) {
-        await message.reply({ content: "无权限" });
-        return true;
-      }
-      const id = parts[1];
-      if (!id || !pendingApprovals.has(id)) {
-        await message.reply({ content: "未找到待审批请求" });
-        return true;
-      }
-      const record = pendingApprovals.get(id);
-      pendingApprovals.delete(id);
-      const decision = verb === "approve" ? "approved" : "rejected";
-      await finalizeApproval(record, decision, message.author?.id);
-      await message.reply({ content: decision === "approved" ? `已批准 ${id}` : `已拒绝 ${id}` });
-      return true;
-    }
-    if (verb === "sessions") {
-      let limitOverride;
-      if (parts[1]) {
-        const parsed = Number(parts[1]);
-        if (!Number.isNaN(parsed) && parsed > 0) limitOverride = Math.min(parsed, 50);
-      }
-      const { sessions, total } = await listSessions(cfg, limitOverride);
-      if (!sessions.length) {
-        await message.reply({
-          content: `未找到会话（sessionsDir=${cfg.sessionsDir}）`,
-        });
-        return true;
-      }
-      const header = `当前会话: ${cfg.codexSessionId}\n最近 ${sessions.length}/${total} 个会话：`;
-      const body = sessions.map(formatSessionLine).join("\n");
-      const footer = `\n用法：${cfg.commandPrefix} session <id|last>`;
-      for (const chunk of splitDiscordMessage(`${header}\n${body}${footer}`)) {
-        await message.reply({ content: chunk });
-      }
-      return true;
-    }
-    if (verb === "session") {
-      if (!parts[1]) {
-        await message.reply({
-          content: `当前会话: ${cfg.codexSessionId}\n用法：${cfg.commandPrefix} session <id|last>`,
-        });
-        return true;
-      }
-      const requested = parts[1].trim();
-      if (!requested) {
-        await message.reply({
-          content: `当前会话: ${cfg.codexSessionId}\n用法：${cfg.commandPrefix} session <id|last>`,
-        });
-        return true;
-      }
-      let found = null;
-      if (requested.toLowerCase() !== "last") {
-        const { sessions } = await listSessions(cfg, Math.max(cfg.sessionsLimit, 50));
-        found = findSessionById(sessions, requested);
-      }
-      try {
-        await updateConfigFile({ codexSessionId: requested });
-        cfg.codexSessionId = requested;
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        await message.reply({ content: `更新配置失败: ${errorText}` });
-        return true;
-      }
-      const envOverride = process.env.CODEX_SESSION_ID;
-      const suffix = envOverride
-        ? "（注意：检测到 CODEX_SESSION_ID 环境变量，可能覆盖配置文件）"
-        : found
-        ? ""
-        : "（未在最近会话里找到，仍然已设置；若无效会话，codex 会报错）";
-      await message.reply({ content: `已切换到会话 ${requested}${suffix}` });
-      return true;
-    }
-    return false;
-  }
-
-  function getSessionKey(message) {
-    if (!cfg.perUserSessions) return "default";
-    if (!message?.author?.id) return "default";
-    if (message.guildId == null) return message.author.id;
-    return `${message.channelId}:${message.author.id}`;
-  }
-
-  function getRunKey(message, kind, taskId) {
-    if (kind === "task" && taskId) {
-      return `task:${message.channelId || message.author?.id || "unknown"}:${taskId}`;
-    }
-    if (cfg.perUserSessions && message?.author?.id) {
-      return getSessionKey(message);
-    }
-    return message.channelId || message.author?.id || "unknown";
-  }
-
-  async function runJob(job) {
-    const { message, prompt, receivedAt, ackedAt, kind, taskId } = job;
-    const runKey = getRunKey(message, kind, taskId);
-    activeRuns.set(runKey, (activeRuns.get(runKey) || 0) + 1);
-    if (cfg.sendTyping) {
-      try {
-        await message.channel.sendTyping();
-      } catch {
-        // ignore
-      }
-    }
-
-    const sanitizedPrompt = redactText(prompt, secrets);
-    const sanitizedContent = redactText(message.content, secrets);
-    const sessionKey = getSessionKey(message);
-    let sessionIdForRun = cfg.codexSessionId;
-    let modeForRun = kind === "task" ? "new" : "resume";
-    let captureSession = false;
-    if (kind === "task") {
-      sessionIdForRun = undefined;
-    }
-    if (!cfg.useAgentsSdk && cfg.perUserSessions && kind !== "task") {
-      const mapped = userSessions[sessionKey];
-      if (mapped) {
-        sessionIdForRun = mapped;
-      } else {
-        sessionIdForRun = undefined;
-        modeForRun = "new";
-        captureSession = true;
-      }
-    }
-    const baseEntry = {
-      ts: receivedAt,
-      timing: {
-        receivedAt,
-        ackedAt,
-      },
-      discord: {
-        channelId: message.channelId,
-        messageId: message.id,
-        authorId: message.author.id,
-        authorTag: message.author.tag,
-        content: sanitizedContent,
-      },
-      codex: {
-        sessionId: sessionIdForRun || cfg.codexSessionId,
-        prompt: sanitizedPrompt,
-      },
-    };
-
-    try {
-      const threadKey = message.channelId || message.author?.id;
-      const result = cfg.useAgentsSdk
-        ? await runAgentsSdk(cfg, prompt, {
-            threadId: threadKey ? agentThreads[threadKey] : undefined,
-          })
-        : await runCodex(cfg, prompt, {
-            mode: modeForRun,
-            sessionId: sessionIdForRun,
-            captureSession,
-          });
-      if (result.exitCode !== 0) {
-        const detail = result.stderr || result.stdout || `codex exited ${result.exitCode}`;
-        throw new Error(detail.trim());
-      }
-      if (cfg.useAgentsSdk && result.threadId && threadKey) {
-        agentThreads[threadKey] = result.threadId;
-        await saveThreadStore(cfg.agentsThreadsFile, agentThreads);
-      }
-      if (!cfg.useAgentsSdk && captureSession && result.sessionId) {
-        userSessions[sessionKey] = result.sessionId;
-        await saveThreadStore(cfg.userSessionsFile, userSessions);
-      }
-      const responseText = redactText(result.responseText || "(no response)", secrets);
-      const respondedAt = new Date().toISOString();
-      const entry = {
-        ...baseEntry,
-        codex: {
-          ...baseEntry.codex,
-          runId: result.runId,
-          threadId: result.threadId || undefined,
-          provider: cfg.useAgentsSdk ? "agents-sdk" : "codex-cli",
-          kind: kind || "prompt",
-          taskId: taskId || undefined,
-          sessionId: result.sessionId || baseEntry.codex.sessionId,
-        },
-        timing: {
-          ...baseEntry.timing,
-          respondedAt,
-        },
-        result: {
-          exitCode: result.exitCode,
-          durationMs: result.durationMs,
-        },
-      };
-
-      await appendMemory(cfg, entry, responseText);
-
-      const finalText =
-        kind === "task" && taskId
-          ? `任务 ${taskId} 完成：\n${responseText}`
-          : responseText;
-      for (const chunk of splitDiscordMessage(finalText)) {
-        await message.reply({ content: chunk });
-      }
-    } catch (err) {
-      const errorText = redactText(
-        err instanceof Error ? err.message : String(err),
-        secrets
-      );
-      const entry = {
-        ...baseEntry,
-        timing: {
-          ...baseEntry.timing,
-          respondedAt: new Date().toISOString(),
-        },
-        error: errorText,
-      };
-
-      await appendMemory(cfg, entry, "");
-
-      try {
-        const replyText = cfg.replyOnError ? `codex error: ${errorText}` : "codex error";
-        for (const chunk of splitDiscordMessage(replyText)) {
-          await message.reply({ content: chunk });
-        }
-      } catch {
-        // ignore
-      }
-    } finally {
-      const nextCount = (activeRuns.get(runKey) || 1) - 1;
-      if (nextCount <= 0) {
-        activeRuns.delete(runKey);
-      } else {
-        activeRuns.set(runKey, nextCount);
-      }
-      processQueue();
-    }
-  }
-
-  function processQueue() {
-    const maxTaskRuns = cfg.maxConcurrentRuns || 1;
-    if (queue.length === 0) return;
-    const taskCount = [...activeRuns.keys()].filter((key) => key.startsWith("task:")).length;
-
-    let pickedIndex = -1;
-    for (let i = 0; i < queue.length; i += 1) {
-      const candidate = queue[i];
-      if (candidate.kind === "task") continue;
-      const key = getRunKey(candidate.message, candidate.kind, candidate.taskId);
-      if (!activeRuns.has(key)) {
-        pickedIndex = i;
-        break;
-      }
-    }
-    if (pickedIndex === -1) {
-      if (taskCount >= maxTaskRuns) return;
-      for (let i = 0; i < queue.length; i += 1) {
-        const candidate = queue[i];
-        const key = getRunKey(candidate.message, candidate.kind, candidate.taskId);
-        if (!activeRuns.has(key)) {
-          pickedIndex = i;
-          break;
-        }
-      }
-    }
-    if (pickedIndex === -1) return;
-
-    const [job] = queue.splice(pickedIndex, 1);
-    void runJob(job);
-    if (queue.length > 0) {
-      processQueue();
-    }
-  }
-
-  client.on("messageCreate", async (message) => {
-    const cleanedContent = stripBotMention(message.content);
-    const isCommand = hasCommandPrefix(cleanedContent, cfg.commandPrefix);
-    const importantMatch = extractImportantNote(cleanedContent);
-    const isSlashLike = cleanedContent.trim().startsWith("/");
-    const isMention = isBotMention(message);
-    if (!isCommand && !importantMatch && !shouldAutoReply(message)) return;
-
-    const allowResult = checkAllowlist(message, cfg);
-    if (!allowResult.allowed) {
-      if (allowResult.reason === "empty_content") {
-        try {
-          await message.reply({ content: "未收到消息内容，请在 Discord 开发者后台开启 Message Content Intent" });
-        } catch {
-          // ignore
-        }
-      }
-      if (cfg.logRejections) {
-        const entry = {
-          ts: new Date().toISOString(),
-          reason: allowResult.reason,
-          commandPrefix: cfg.commandPrefix,
-          kind: isCommand ? "command" : importantMatch ? "important" : "auto-reply",
-          discord: {
-            channelId: message.channelId,
-            messageId: message.id,
-            authorId: message.author.id,
-            authorTag: message.author.tag,
-            content: message.content,
+          onDelta: (_delta, totalText) => {
+            liveText = totalText;
+            scheduleStreamFlush();
           },
-        };
-        await appendRejection(cfg, entry);
-      }
-      return;
-    }
+          onCommandDelta: (_delta, totalCmdText) => {
+            commandText = totalCmdText;
+            scheduleStreamFlush();
+          },
+        });
 
-    if ((isCommand || importantMatch || isSlashLike) && !isOwnerMessage(message)) {
-      try {
-        await message.reply({ content: "无权限" });
-      } catch {
-        // ignore
-      }
-      return;
-    }
+        if (streamTimer) {
+          clearTimeout(streamTimer);
+          streamTimer = null;
+        }
 
-    if (importantMatch) {
-      if (!importantMatch.note) {
-        await message.reply({ content: "请在关键词后输入要记录的内容" });
-        return;
-      }
-      const entry = {
-        ts: new Date().toISOString(),
-        keyword: importantMatch.keyword,
-        note: importantMatch.note,
-        discord: {
-          channelId: message.channelId,
-          messageId: message.id,
-          authorId: message.author.id,
-          authorTag: message.author.tag,
-          content: message.content,
-        },
-      };
-      if (cfg.requireOwnerApproval && !isOwnerMessage(message)) {
-        const { needsApproval, reasons, evidence, forceReject } = await evaluateRisk(
-          message.content,
-          {
-            isCommand: true,
-            isImportant: true,
-            actor: message,
-          }
+        await flushStream(true);
+
+        const interrupted = result.status === "interrupted" || cancelRequestedTaskId === taskId;
+        const finalStatus = interrupted ? "cancelled" : result.status === "failed" ? "failed" : "success";
+
+        const finalOutput = liveText || result.textOutput || "(empty response)";
+        const chunks = splitDiscordMessage(finalOutput, 1900);
+
+        const finalHeader = finalStatus === "success"
+          ? `✅ #${taskId} 完成`
+          : finalStatus === "cancelled"
+            ? `🛑 #${taskId} 已取消`
+            : `❌ #${taskId} 失败`;
+
+        await ackMessage.edit(`${finalHeader}\n\n${chunks[0]}`);
+        for (const chunk of chunks.slice(1)) {
+          await source.send(chunk);
+        }
+
+        await appendTaskEvent(cfg, {
+          ...taskBase,
+          threadId: result.threadId || runtime.activeThreadId,
+          turnId: result.turnId || null,
+          status: finalStatus,
+          completedAt: nowIso(),
+          outputSummary: finalOutput.slice(0, 500),
+        }, secrets);
+
+        if (cancelRequestedTaskId === taskId) {
+          cancelRequestedTaskId = null;
+        }
+
+        await persistRuntime({
+          activeTurnId: null,
+          activeTaskId: null,
+          activeTaskStartedAt: null,
+          lastError: finalStatus === "failed"
+            ? { at: nowIso(), message: `task ${taskId} failed` }
+            : runtime.lastError,
+        });
+      } catch (error) {
+        if (streamTimer) {
+          clearTimeout(streamTimer);
+        }
+
+        const redactedError = redactText(error?.message || String(error), secrets);
+        const cancelled = cancelRequestedTaskId === taskId || /interrupt/i.test(redactedError);
+        const finalStatus = cancelled ? "cancelled" : "failed";
+
+        await replyChunks(
+          async (content) => ackMessage.edit(content),
+          `${finalStatus === "cancelled" ? "🛑" : "❌"} #${taskId} ${finalStatus}\n${redactedError}`
         );
-        if (needsApproval) {
-          if (forceReject) {
-            await message.reply({ content: "已拒绝：安全限制" });
-            return;
-          }
-          await requestOwnerApproval({
-            message,
-            prompt: message.content,
-            kind: "important",
-            reasons,
-            evidence,
-          });
-          return;
-        }
-      }
-      await appendImportant(cfg, entry);
-      await message.reply({ content: cfg.importantReply });
-      return;
-    }
 
-    const receivedAt = new Date().toISOString();
-    const prompt = isCommand
-      ? extractPrompt(cleanedContent, cfg.commandPrefix)
-      : cleanedContent.trim();
+        await appendTaskEvent(cfg, {
+          ...taskBase,
+          status: finalStatus,
+          completedAt: nowIso(),
+          errorCode: finalStatus === "cancelled" ? "INTERRUPTED" : "RUNTIME_ERROR",
+          errorMessage: redactedError,
+        }, secrets);
 
-    if (cfg.requireOwnerApproval && !isOwnerMessage(message)) {
-      const { needsApproval, reasons, evidence, forceReject } = await evaluateRisk(prompt, {
-        isCommand: isCommand || isSlashCommandMessage(message),
-        isImportant: false,
-        actor: message,
-      });
-      if (needsApproval) {
-        if (forceReject) {
-          await message.reply({ content: "已拒绝：安全限制" });
-          return;
+        if (cancelRequestedTaskId === taskId) {
+          cancelRequestedTaskId = null;
         }
-        await requestOwnerApproval({
-          message,
-          prompt,
-          kind: isCommand ? "command" : "prompt",
-          reasons,
-          evidence,
+
+        await persistRuntime({
+          activeTurnId: null,
+          activeTaskId: null,
+          activeTaskStartedAt: null,
+          lastError: {
+            at: nowIso(),
+            message: redactedError,
+          },
         });
-        return;
       }
+    });
+  }
+
+  client.once("clientReady", async () => {
+    await persistRuntime({ discordStatus: "ready" });
+
+    try {
+      const slashResult = await registerSlashCommands(client, cfg, logger);
+      logger.info("slash commands registered", slashResult);
+    } catch (error) {
+      logger.error("slash registration failed", {
+        error: error?.message || String(error),
+      });
     }
-    if (isCommand) {
-      try {
-        const handled = await handleBotCommand(message, prompt);
-        if (handled) return;
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        await message.reply({ content: `command error: ${errorText}` });
-        return;
-      }
-    }
-    if (!prompt) {
-      if (isMention) {
-        await message.reply({ content: "在的，请直接说需求。" });
-        return;
-      }
-      await message.reply({ content: usageMessage(cfg.commandPrefix) });
-      return;
-    }
-    let routedKind = isCommand ? "command" : "prompt";
-    let taskId;
-    if (!isCommand && !importantMatch && cfg.autoTaskRouting) {
-      try {
-        const forceTask = shouldForceTask(prompt);
-        const route = forceTask ? { route: "task", reason: "rule" } : await decideTaskRoute(cfg, prompt);
-        if (route.route === "task") {
-          routedKind = "task";
-          taskId = crypto.randomUUID().slice(0, 8);
-          await message.reply({ content: `任务已派发：${taskId}` });
-        }
-      } catch (err) {
-        console.warn("auto task routing failed", err?.message || err);
-      }
-    }
-    let ackedAt;
-    if (cfg.immediateAck) {
-      try {
-        await message.reply({ content: cfg.ackMessage });
-        ackedAt = new Date().toISOString();
-      } catch {
-        ackedAt = undefined;
-      }
-    }
-    queue.push({ message, prompt, receivedAt, ackedAt, kind: routedKind, taskId });
-    processQueue();
   });
 
   client.on("interactionCreate", async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const access = checkInteractionAccess(interaction, cfg);
+    if (!access.allowed) {
+      await interaction.reply({ content: "⛔ 仅 owner 私信可用", fetchReply: false });
+      return;
+    }
+
     try {
-      if (interaction.isButton()) {
-        const customId = interaction.customId || "";
-        if (!customId.startsWith("approval:")) return;
-        const [, action, requestId] = customId.split(":");
-        if (!isOwnerMessage({ author: interaction.user })) {
-          await interaction.reply({ content: "无权限", ephemeral: true });
-          return;
-        }
-        if (!pendingApprovals.has(requestId)) {
-          await interaction.reply({ content: "审批已处理或不存在", ephemeral: true });
-          return;
-        }
-        await interaction.deferUpdate();
-        const record = pendingApprovals.get(requestId);
-        pendingApprovals.delete(requestId);
-        const decision = action === "approve" ? "approved" : "rejected";
-        await finalizeApproval(record, decision, interaction.user?.id);
+      if (interaction.commandName === COMMAND_NAMES.ask) {
+        const prompt = interaction.options.getString("prompt", true);
+        await submitTask(prompt, createInteractionSource(interaction));
         return;
       }
-      await handleInteractionCommand(interaction);
-    } catch (err) {
-      const errorText = err instanceof Error ? err.message : String(err);
+
+      if (interaction.commandName === COMMAND_NAMES.newThread) {
+        const thread = await appServer.startThread();
+        await persistRuntime({ activeThreadId: thread?.id || null });
+        await interaction.reply({
+          content: `🧵 已创建新 thread: ${thread?.id || "(unknown)"}`,
+          fetchReply: false,
+        });
+        return;
+      }
+
+      if (interaction.commandName === COMMAND_NAMES.thread) {
+        const threadId = interaction.options.getString("id", true).trim();
+        const thread = await appServer.resumeThread(threadId);
+        await persistRuntime({ activeThreadId: thread?.id || threadId });
+        await interaction.reply({
+          content: `🧵 已切换到 thread: ${thread?.id || threadId}`,
+          fetchReply: false,
+        });
+        return;
+      }
+
+      if (interaction.commandName === COMMAND_NAMES.threads) {
+        const limit = interaction.options.getInteger("limit") || 10;
+        const threads = await appServer.listThreads(limit);
+        if (!threads.length) {
+          await interaction.reply({ content: "暂无 thread 记录", fetchReply: false });
+          return;
+        }
+
+        const lines = ["🧵 最近 threads:"];
+        threads.forEach((item, index) => {
+          lines.push(`${index + 1}. ${formatThreadPreview(item)}`);
+        });
+
+        await interaction.reply({ content: lines.join("\n"), fetchReply: false });
+        return;
+      }
+
+      if (interaction.commandName === COMMAND_NAMES.status) {
+        await interaction.reply({
+          content: buildStatusText(runtime, queue),
+          fetchReply: false,
+        });
+        return;
+      }
+
+      if (interaction.commandName === COMMAND_NAMES.stop) {
+        if (!runtime.activeTurnId || !runtime.activeThreadId) {
+          await interaction.reply({ content: "当前没有运行中的任务", fetchReply: false });
+          return;
+        }
+
+        cancelRequestedTaskId = runtime.activeTaskId || null;
+        await appServer.interruptTurn(runtime.activeThreadId, runtime.activeTurnId);
+        await interaction.reply({
+          content: `🛑 已发送中断请求（task=${runtime.activeTaskId || "unknown"}）`,
+          fetchReply: false,
+        });
+        return;
+      }
+
+      await interaction.reply({ content: "未知命令", fetchReply: false });
+    } catch (error) {
+      const redacted = redactText(error?.message || String(error), secrets);
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: `command error: ${errorText}`, ephemeral: true });
+        await interaction.reply({ content: `❌ ${redacted}`, fetchReply: false });
+      } else {
+        await interaction.followUp({ content: `❌ ${redacted}`, fetchReply: false });
       }
     }
   });
 
-  async function reconnectIfNeeded() {
-    if (reconnecting) return;
-    if (client.isReady()) return;
-    if (!lastDisconnectAt) return;
-    const elapsed = Date.now() - lastDisconnectAt;
-    if (elapsed < cfg.reconnectTimeoutMs) return;
-    reconnecting = true;
+  client.on("messageCreate", async (message) => {
+    const access = checkMessageAccess(message, cfg);
+    if (!access.allowed) return;
+    if (!cfg.allowPlainTextDm) return;
+
+    const content = String(message.content || "").trim();
+    if (!content) return;
+
     try {
-      console.warn("discord reconnect watchdog: forcing re-login");
-      try {
-        await client.destroy();
-      } catch {
-        // ignore
-      }
-      await client.login(cfg.discordToken);
-      lastDisconnectAt = undefined;
-    } finally {
-      reconnecting = false;
-    }
-  }
-
-  client.on("shardDisconnect", () => {
-    lastDisconnectAt = Date.now();
-  });
-
-  client.on("shardResume", () => {
-    lastDisconnectAt = undefined;
-  });
-
-  client.once("ready", async () => {
-    try {
-      const result = await registerSlashCommands(client, cfg);
-      if (result?.registered) {
-        console.log(`slash commands registered (${result.scope})`);
-      }
-      scheduler.startAll();
-      startMessageServer(client, cfg);
-    } catch (err) {
-      console.warn("slash command registration failed", err?.message || err);
-    }
-  });
-
-  setInterval(() => {
-    reconnectIfNeeded().catch((err) => console.error("reconnect failed", err));
-  }, cfg.reconnectIntervalMs).unref?.();
-
-  process.on("SIGINT", async () => {
-    try {
-      await client.destroy();
-    } finally {
-      process.exit(0);
+      await submitTask(content, createMessageSource(message));
+    } catch (error) {
+      const redacted = redactText(error?.message || String(error), secrets);
+      await message.reply(`❌ ${redacted}`);
     }
   });
 
   await client.login(cfg.discordToken);
+
+  async function gracefulShutdown(signal) {
+    logger.info("shutdown signal received", { signal });
+    await persistRuntime({ discordStatus: "down", appServerStatus: "down" });
+    await appServer.stop();
+    await client.destroy();
+    process.exit(0);
+  }
+
+  process.on("SIGINT", () => {
+    void gracefulShutdown("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    void gracefulShutdown("SIGTERM");
+  });
 }
 
-main().catch((err) => {
-  console.error(err);
+main().catch((error) => {
+  console.error("fatal error", error);
   process.exit(1);
 });

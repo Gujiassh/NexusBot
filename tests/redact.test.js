@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
 import { collectSecrets, redactText } from "../src/utils/redact.js";
 
 test("redactText replaces explicit secrets", () => {
@@ -15,11 +16,25 @@ test("redactText replaces Discord token pattern", () => {
   assert.equal(output, "bot [REDACTED]");
 });
 
-test("collectSecrets includes DISCORD_TOKEN env", () => {
-  const original = process.env.DISCORD_TOKEN;
+test("redactText replaces authorization and cookie values", () => {
+  const input = "Authorization: Bearer abc123\nCookie: sid=xyz";
+  const output = redactText(input, []);
+  assert.match(output, /Authorization: \[REDACTED\]/i);
+  assert.match(output, /Cookie: \[REDACTED\]/i);
+});
+
+test("collectSecrets includes config and env tokens", () => {
+  const originalDiscord = process.env.DISCORD_TOKEN;
+  const originalOpenai = process.env.OPENAI_API_KEY;
   process.env.DISCORD_TOKEN = "env-token";
+  process.env.OPENAI_API_KEY = "sk-test-12345678901234567890";
+
   const secrets = collectSecrets({ discordToken: "cfg-token" });
-  process.env.DISCORD_TOKEN = original;
+
+  process.env.DISCORD_TOKEN = originalDiscord;
+  process.env.OPENAI_API_KEY = originalOpenai;
+
   assert.ok(secrets.includes("cfg-token"));
   assert.ok(secrets.includes("env-token"));
+  assert.ok(secrets.includes("sk-test-12345678901234567890"));
 });
