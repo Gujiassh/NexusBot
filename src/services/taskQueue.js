@@ -26,6 +26,10 @@ export class TaskQueue {
     return [...this.activeItems.values()].map((item) => item.meta);
   }
 
+  get pending() {
+    return this.queue.map((item) => item.meta);
+  }
+
   async _notify() {
     if (!this.onStateChange) return;
 

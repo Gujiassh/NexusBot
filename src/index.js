@@ -94,6 +94,48 @@ function buildHistoryText(taskSnapshots) {
   return lines.join("\n");
 }
 
+function buildTasksText({ queue, activeTasks, pendingTasks, recentTasks }) {
+  const lines = [
+    "🗂 Task Panel",
+    `- active: ${(activeTasks || []).length}/${queue.concurrency}`,
+    `- queued: ${(pendingTasks || []).length}`,
+  ];
+
+  if (activeTasks && activeTasks.length) {
+    lines.push("", "🏃 Running:");
+    activeTasks.forEach((item, index) => {
+      const startedAt = item.startedAt ? formatDurationMs(item.startedAt) : "-";
+      lines.push(
+        `${index + 1}. ${item.taskId || "(unknown)"} turn=${item.turnId || "-"} thread=${item.threadId || "-"} runtime=${startedAt}`
+      );
+      const prompt = compactText(item.inputText, 120);
+      if (prompt) lines.push(`   ↳ ${prompt}`);
+    });
+  }
+
+  if (pendingTasks && pendingTasks.length) {
+    lines.push("", "🧾 Queued:");
+    pendingTasks.slice(0, 10).forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.taskId || "(unknown)"}`);
+    });
+    if (pendingTasks.length > 10) {
+      lines.push(`... and ${pendingTasks.length - 10} more`);
+    }
+  }
+
+  if (recentTasks && recentTasks.length) {
+    lines.push("", "🕘 Recent:");
+    recentTasks.slice(0, 10).forEach((item, index) => {
+      const status = item.status || "unknown";
+      lines.push(`${index + 1}. ${statusIcon(status)} ${item.taskId || "(unknown)"} [${status}]`);
+      const prompt = compactText(item.inputText, 80);
+      if (prompt) lines.push(`   ↳ ${prompt}`);
+    });
+  }
+
+  return lines.join("\n");
+}
+
 function buildRecallPrompt(taskSnapshots) {
   const ordered = [...taskSnapshots].reverse();
   const lines = ordered.map((item, index) => {
@@ -453,6 +495,44 @@ async function main() {
     return threadId;
   }
 
+  async function restartControlAppServer() {
+    const sharedRunningTaskIds = [...activeTaskContexts.values()]
+      .filter((ctx) => ctx.appServer === controlAppServer)
+      .map((ctx) => ctx.taskId)
+      .filter(Boolean);
+
+    if (sharedRunningTaskIds.length) {
+      throw new Error(`shared tasks running, cannot restart: ${sharedRunningTaskIds.join(", ")}`);
+    }
+
+    await persistRuntime({ appServerStatus: "restarting" });
+
+    await controlAppServer.stop();
+    await controlAppServer.start();
+
+    let threadId = runtime.activeThreadId || null;
+    if (threadId) {
+      try {
+        const resumed = await controlAppServer.resumeThread(threadId);
+        threadId = resumed?.id || threadId;
+      } catch {
+        const thread = await controlAppServer.startThread();
+        threadId = thread?.id || null;
+      }
+    } else {
+      const thread = await controlAppServer.startThread();
+      threadId = thread?.id || null;
+    }
+
+    await persistRuntime({
+      appServerStatus: "ready",
+      activeThreadId: threadId,
+      lastError: null,
+    });
+
+    return threadId;
+  }
+
   function resolveRunningTaskContext(requestedTaskId) {
     if (requestedTaskId) {
       const ctx = activeTaskContexts.get(requestedTaskId);
@@ -521,6 +601,7 @@ async function main() {
         threadId: taskThreadId,
         turnId,
         startedAt,
+        inputText,
       };
 
       const flushStream = async (force = false) => {
@@ -760,6 +841,30 @@ async function main() {
         return;
       }
 
+      if (interaction.commandName === COMMAND_NAMES.tasks) {
+        const limit = interaction.options.getInteger("limit") || cfg.historyDefaultLimit;
+        const snapshots = await listRecentTaskSnapshots(cfg, { limit });
+        const activeTasks = [...activeTaskContexts.values()].map((ctx) => ({
+          taskId: ctx.taskId,
+          threadId: ctx.threadId,
+          turnId: ctx.turnId,
+          startedAt: ctx.startedAt,
+          inputText: ctx.inputText,
+        }));
+        const pendingTasks = queue.pending || [];
+
+        const panelText = buildTasksText({
+          queue,
+          activeTasks,
+          pendingTasks,
+          recentTasks: snapshots,
+        });
+
+        const source = createInteractionSource(interaction);
+        await replyChunks(async (content) => source.send(content), panelText);
+        return;
+      }
+
       if (interaction.commandName === COMMAND_NAMES.history) {
         const limit = interaction.options.getInteger("limit") || cfg.historyDefaultLimit;
         const snapshots = await listRecentTaskSnapshots(cfg, { limit });
@@ -831,6 +936,24 @@ async function main() {
           content: `🛑 已发送中断请求（task=${taskId}, turn=${context.turnId}）`,
           fetchReply: false,
         });
+        return;
+      }
+
+      if (interaction.commandName === COMMAND_NAMES.restart) {
+        const source = createInteractionSource(interaction);
+        const ack = await source.ack("♻️ 正在重启 control app-server...");
+
+        try {
+          const threadId = await restartControlAppServer();
+          await ack.edit(`✅ control app-server 已重启，thread=${threadId || "(none)"}`);
+        } catch (error) {
+          const redacted = redactText(error?.message || String(error), secrets);
+          await persistRuntime({
+            appServerStatus: "down",
+            lastError: { at: nowIso(), message: redacted },
+          });
+          await ack.edit(`❌ 重启失败: ${redacted}`);
+        }
         return;
       }
 

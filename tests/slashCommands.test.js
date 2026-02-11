@@ -14,8 +14,10 @@ test("slash command set matches expected names", () => {
     COMMAND_NAMES.newThread,
     COMMAND_NAMES.thread,
     COMMAND_NAMES.threads,
+    COMMAND_NAMES.tasks,
     COMMAND_NAMES.status,
     COMMAND_NAMES.stop,
+    COMMAND_NAMES.restart,
     COMMAND_NAMES.history,
     COMMAND_NAMES.recall,
   ].sort();
@@ -53,6 +55,17 @@ test("threads command has bounded optional limit option", () => {
   assert.equal(limit.max_value, 20);
 });
 
+test("tasks command has bounded optional limit option", () => {
+  const tasks = findCommand(COMMAND_NAMES.tasks);
+  assert.ok(tasks);
+
+  const limit = (tasks.options || []).find((opt) => opt.name === "limit");
+  assert.ok(limit);
+  assert.equal(limit.required, false);
+  assert.equal(limit.min_value, 1);
+  assert.equal(limit.max_value, 20);
+});
+
 test("stop command supports optional task_id", () => {
   const stop = findCommand(COMMAND_NAMES.stop);
   assert.ok(stop);
@@ -60,6 +73,12 @@ test("stop command supports optional task_id", () => {
   const taskId = (stop.options || []).find((opt) => opt.name === "task_id");
   assert.ok(taskId);
   assert.equal(taskId.required, false);
+});
+
+test("restart command has no options", () => {
+  const restart = findCommand(COMMAND_NAMES.restart);
+  assert.ok(restart);
+  assert.ok(!restart.options || restart.options.length === 0);
 });
 
 test("history and recall commands support bounded limit", () => {

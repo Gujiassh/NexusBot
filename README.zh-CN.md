@@ -22,10 +22,12 @@
 - `/new`：新建并切换控制 thread
 - `/thread id:<threadId>`：切换控制 thread
 - `/threads [limit]`：查看最近 thread 列表
+- `/tasks [limit]`：查看运行中/排队任务与近期快照
 - `/history [limit]`：查看本地任务历史
 - `/recall [limit]`：把最近历史回填到当前控制 thread
 - `/status`：查看当前队列和运行状态
 - `/stop [task_id]`：中断当前任务或指定运行中任务
+- `/restart`：重启 control app-server 并重新挂载控制 thread
 
 owner 发送普通 DM 文本也会作为任务输入（可配置关闭）。
 

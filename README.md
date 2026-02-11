@@ -22,10 +22,12 @@ This rewrite optimizes for reliability and operational simplicity:
 - `/new` → create and switch control thread
 - `/thread id:<threadId>` → switch control thread
 - `/threads [limit]` → list recent threads
+- `/tasks [limit]` → show running + queued tasks + recent task snapshot
 - `/history [limit]` → list recent task history from local logs
 - `/recall [limit]` → import recent task memory into current control thread
 - `/status` → show queue/runtime state
 - `/stop [task_id]` → interrupt current task, or specific running task
+- `/restart` → restart control app-server and reattach control thread
 
 Plain DM text from owner is also treated as task input (configurable).
 
