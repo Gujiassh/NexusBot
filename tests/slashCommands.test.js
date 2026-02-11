@@ -16,6 +16,8 @@ test("slash command set matches expected names", () => {
     COMMAND_NAMES.threads,
     COMMAND_NAMES.status,
     COMMAND_NAMES.stop,
+    COMMAND_NAMES.history,
+    COMMAND_NAMES.recall,
   ].sort();
 
   assert.deepEqual(names, expected);
@@ -49,4 +51,26 @@ test("threads command has bounded optional limit option", () => {
   assert.equal(limit.required, false);
   assert.equal(limit.min_value, 1);
   assert.equal(limit.max_value, 20);
+});
+
+test("stop command supports optional task_id", () => {
+  const stop = findCommand(COMMAND_NAMES.stop);
+  assert.ok(stop);
+
+  const taskId = (stop.options || []).find((opt) => opt.name === "task_id");
+  assert.ok(taskId);
+  assert.equal(taskId.required, false);
+});
+
+test("history and recall commands support bounded limit", () => {
+  for (const commandName of [COMMAND_NAMES.history, COMMAND_NAMES.recall]) {
+    const command = findCommand(commandName);
+    assert.ok(command);
+
+    const limit = (command.options || []).find((opt) => opt.name === "limit");
+    assert.ok(limit);
+    assert.equal(limit.required, false);
+    assert.equal(limit.min_value, 1);
+    assert.equal(limit.max_value, 20);
+  }
 });

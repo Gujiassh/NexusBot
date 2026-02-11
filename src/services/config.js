@@ -39,6 +39,15 @@ function firstNonEmpty(...values) {
   return undefined;
 }
 
+function parseTaskThreadMode(value, fallback = "isolated") {
+  const raw = firstNonEmpty(value, fallback, "isolated");
+  const mode = String(raw).trim().toLowerCase();
+  if (mode === "isolated" || mode === "shared") {
+    return mode;
+  }
+  throw new Error(`Invalid taskThreadMode: ${value}`);
+}
+
 async function loadFileConfig() {
   try {
     const raw = await fs.readFile(CONFIG_PATH, "utf8");
@@ -118,6 +127,19 @@ export async function loadConfig() {
     requestTimeoutMs: parseIntSafe(
       process.env.REQUEST_TIMEOUT_MS,
       parseIntSafe(fileConfig.requestTimeoutMs, 30 * 1000)
+    ),
+    maxConcurrentTasks: Math.max(
+      1,
+      parseIntSafe(process.env.MAX_CONCURRENT_TASKS, parseIntSafe(fileConfig.maxConcurrentTasks, 2))
+    ),
+    taskThreadMode: parseTaskThreadMode(process.env.TASK_THREAD_MODE ?? fileConfig.taskThreadMode, "isolated"),
+    historyDefaultLimit: Math.max(
+      1,
+      parseIntSafe(process.env.HISTORY_DEFAULT_LIMIT, parseIntSafe(fileConfig.historyDefaultLimit, 10))
+    ),
+    recallDefaultLimit: Math.max(
+      1,
+      parseIntSafe(process.env.RECALL_DEFAULT_LIMIT, parseIntSafe(fileConfig.recallDefaultLimit, 8))
     ),
     lockFile: path.resolve(firstNonEmpty(process.env.LOCK_FILE, fileConfig.lockFile, "/tmp/codex-discord-bridge-v2.lock")),
     dataDir,

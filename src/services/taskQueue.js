@@ -6,10 +6,11 @@ export function createTaskId(now = Date.now()) {
 }
 
 export class TaskQueue {
-  constructor({ onStateChange } = {}) {
+  constructor({ concurrency = 1, onStateChange } = {}) {
+    const parsed = Number.parseInt(String(concurrency), 10);
+    this.concurrency = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
     this.queue = [];
-    this.running = false;
-    this.current = null;
+    this.activeItems = new Map();
     this.onStateChange = typeof onStateChange === "function" ? onStateChange : null;
   }
 
@@ -17,15 +18,24 @@ export class TaskQueue {
     return this.queue.length;
   }
 
+  get activeCount() {
+    return this.activeItems.size;
+  }
+
   get active() {
-    return this.current;
+    return [...this.activeItems.values()].map((item) => item.meta);
   }
 
   async _notify() {
     if (!this.onStateChange) return;
+
+    const activeTasks = this.active;
     await this.onStateChange({
       queueLength: this.queue.length,
-      activeTask: this.current?.meta || null,
+      activeTask: activeTasks[0] || null,
+      activeTasks,
+      activeCount: activeTasks.length,
+      concurrency: this.concurrency,
     });
   }
 
@@ -37,23 +47,26 @@ export class TaskQueue {
     });
   }
 
-  async _drain() {
-    if (this.running) return;
-    this.running = true;
-    while (this.queue.length) {
-      const item = this.queue.shift();
-      this.current = item;
+  async _runItem(token, item) {
+    try {
+      const result = await item.handler();
+      item.resolve(result);
+    } catch (error) {
+      item.reject(error);
+    } finally {
+      this.activeItems.delete(token);
       await this._notify();
-      try {
-        const result = await item.handler();
-        item.resolve(result);
-      } catch (error) {
-        item.reject(error);
-      } finally {
-        this.current = null;
-        await this._notify();
-      }
+      void this._drain();
     }
-    this.running = false;
+  }
+
+  async _drain() {
+    while (this.activeItems.size < this.concurrency && this.queue.length > 0) {
+      const item = this.queue.shift();
+      const token = Symbol(item?.meta?.taskId || "task");
+      this.activeItems.set(token, item);
+      await this._notify();
+      void this._runItem(token, item);
+    }
   }
 }

@@ -12,6 +12,42 @@ async function ensureParent(filePath) {
   await fs.mkdir(dir, { recursive: true });
 }
 
+function defaultRuntimeState() {
+  return {
+    activeThreadId: null,
+    activeTurnId: null,
+    activeTaskId: null,
+    queueLength: 0,
+    appServerStatus: "starting",
+    discordStatus: "connecting",
+    lastError: null,
+    updatedAt: withNow(),
+  };
+}
+
+function tryParseJsonLine(rawLine) {
+  const line = String(rawLine || "").trim();
+  if (!line) return null;
+  try {
+    const parsed = JSON.parse(line);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function toTaskSnapshot(previous, event) {
+  const prior = previous || {};
+  const current = event || {};
+
+  return {
+    ...prior,
+    ...current,
+    createdAt: prior.createdAt || current.createdAt || current.updatedAt || null,
+    updatedAt: current.updatedAt || prior.updatedAt || null,
+  };
+}
+
 export async function initializeRuntimeStore(cfg) {
   await fs.mkdir(cfg.dataDir, { recursive: true });
   await fs.mkdir(cfg.logsDir, { recursive: true });
@@ -22,17 +58,7 @@ export async function initializeRuntimeStore(cfg) {
   try {
     await fs.access(cfg.runtimeStateFile);
   } catch {
-    const initial = {
-      activeThreadId: null,
-      activeTurnId: null,
-      activeTaskId: null,
-      queueLength: 0,
-      appServerStatus: "starting",
-      discordStatus: "connecting",
-      lastError: null,
-      updatedAt: withNow(),
-    };
-    await fs.writeFile(cfg.runtimeStateFile, `${JSON.stringify(initial, null, 2)}\n`, "utf8");
+    await fs.writeFile(cfg.runtimeStateFile, `${JSON.stringify(defaultRuntimeState(), null, 2)}\n`, "utf8");
   }
 }
 
@@ -40,29 +66,9 @@ export async function loadRuntimeState(cfg) {
   try {
     const raw = await fs.readFile(cfg.runtimeStateFile, "utf8");
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object"
-      ? parsed
-      : {
-        activeThreadId: null,
-        activeTurnId: null,
-        activeTaskId: null,
-        queueLength: 0,
-        appServerStatus: "starting",
-        discordStatus: "connecting",
-        lastError: null,
-        updatedAt: withNow(),
-      };
+    return parsed && typeof parsed === "object" ? parsed : defaultRuntimeState();
   } catch {
-    return {
-      activeThreadId: null,
-      activeTurnId: null,
-      activeTaskId: null,
-      queueLength: 0,
-      appServerStatus: "starting",
-      discordStatus: "connecting",
-      lastError: null,
-      updatedAt: withNow(),
-    };
+    return defaultRuntimeState();
   }
 }
 
@@ -83,6 +89,36 @@ export async function appendTaskEvent(cfg, event, secrets = []) {
   };
   await ensureParent(cfg.tasksFile);
   await fs.appendFile(cfg.tasksFile, `${JSON.stringify(payload)}\n`, "utf8");
+}
+
+export async function listRecentTaskSnapshots(cfg, { limit = 10 } = {}) {
+  const safeLimit = Math.max(1, Number.parseInt(String(limit), 10) || 10);
+
+  let raw;
+  try {
+    raw = await fs.readFile(cfg.tasksFile, "utf8");
+  } catch {
+    return [];
+  }
+
+  const snapshots = new Map();
+  const lines = raw.split("\n");
+
+  for (const line of lines) {
+    const event = tryParseJsonLine(line);
+    if (!event?.taskId) continue;
+
+    const prev = snapshots.get(event.taskId);
+    snapshots.set(event.taskId, toTaskSnapshot(prev, event));
+  }
+
+  return [...snapshots.values()]
+    .sort((a, b) => {
+      const aKey = a.createdAt || a.updatedAt || "";
+      const bKey = b.createdAt || b.updatedAt || "";
+      return bKey.localeCompare(aKey);
+    })
+    .slice(0, safeLimit);
 }
 
 export function createLogger(cfg, secrets = []) {

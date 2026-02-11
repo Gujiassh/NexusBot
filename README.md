@@ -14,15 +14,18 @@ This rewrite optimizes for reliability and operational simplicity:
 - Removes optional HTTP inbound server by default
 - Uses explicit thread/turn APIs (`thread/*`, `turn/*`)
 - Keeps durable local task/runtime logs for troubleshooting
+- Supports **non-blocking dispatch + concurrent workers** to avoid one stuck task blocking all conversations
 
 ## Commands (DM with bot)
 
 - `/ask prompt:<text>` → enqueue and execute a task
-- `/new` → create and switch to a new thread
-- `/thread id:<threadId>` → switch to an existing thread
+- `/new` → create and switch control thread
+- `/thread id:<threadId>` → switch control thread
 - `/threads [limit]` → list recent threads
+- `/history [limit]` → list recent task history from local logs
+- `/recall [limit]` → import recent task memory into current control thread
 - `/status` → show queue/runtime state
-- `/stop` → interrupt current running turn
+- `/stop [task_id]` → interrupt current task, or specific running task
 
 Plain DM text from owner is also treated as task input (configurable).
 
@@ -63,6 +66,15 @@ At minimum set in `config.json`:
 - `ownerUserId`
 - `codexCwd`
 
+## Performance + continuity config
+
+- `maxConcurrentTasks` (default `2`): max tasks running in parallel
+- `taskThreadMode` (default `isolated`):
+  - `isolated`: each task runs in its own thread (recommended, avoids cross-task blocking)
+  - `shared`: tasks reuse control thread
+- `historyDefaultLimit` (default `10`): default `/history` count
+- `recallDefaultLimit` (default `8`): default `/recall` import count
+
 ## Runtime files
 
 - `data/tasks.jsonl` → append-only lifecycle events
@@ -79,5 +91,5 @@ npm test
 ## Notes
 
 - `config.json` is gitignored; keep secrets local.
-- Unknown app-server notifications are ignored safely and logged.
+- Unknown/noisy app-server notifications are ignored safely.
 - This repo keeps legacy files from v1 for compatibility, but v2 entrypoint is `src/index.js`.
